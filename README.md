@@ -47,4 +47,4 @@ Two LSP-side routes the standard also names live in the adapter, not the worker:
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). The names, logo and site are not licensed — see [TRADEMARKS.md](TRADEMARKS.md).
