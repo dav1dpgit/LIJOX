@@ -1,0 +1,13 @@
+name = "lij-worker"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+[[kv_namespaces]]
+binding = "LIJ_KV"
+id = "13cec7dca0c247f290bb4a3b12ed98e3"
+
+# 0.5.0 (S43): the neutral address host — only this path reaches the worker;
+# the rest of lightninginajar.xyz stays the Pages site.
+routes = [
+  { pattern = "lightninginajar.xyz/.well-known/lnurlp/*", zone_name = "lightninginajar.xyz" },
+]

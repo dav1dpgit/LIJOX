@@ -1,0 +1,91 @@
+name: lij-worker-deploy
+
+# Session 27: the lij worker previously had NO deploy path in CI — the live
+# script predated the repo source (fingerprint: live 404'd /lsps1/channel,
+# a route the repo has carried uncalled; /backup/challenge matched). This
+# workflow makes git the deploy truth for the worker, mirroring the
+# pageapp convention (cloudflare/wrangler-action@v3 + CLOUDFLARE_API_TOKEN).
+# Cloudflare surfaces deploy from git; only the UM890 is hand-loaded.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'lij-worker/**'
+      - '.github/workflows/lij-worker-deploy.yml'
+  workflow_dispatch: {}
+
+concurrency:
+  group: lij-worker-deploy
+  cancel-in-progress: false   # never cancel a deploy mid-flight
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies (no lockfile in lij-worker; wrangler bundles from node_modules)
+        working-directory: lij-worker
+        run: npm install --no-audit --no-fund
+
+      - name: Register-signature sign↔verify gate (S41 — a red here blocks deploy)
+        working-directory: lij-worker
+        run: node test-register-sig.mjs
+
+      - name: Diagnose — secret presence only (never values)
+        run: |
+          ok=0
+          [ -n "${{ secrets.CLOUDFLARE_API_TOKEN }}" ] && { echo "CLOUDFLARE_API_TOKEN: present"; ok=1; } || echo "CLOUDFLARE_API_TOKEN: MISSING"
+          [ -n "${{ secrets.CF_API_TOKEN }}" ] && echo "CF_API_TOKEN: present (alternate name exists)" || true
+          [ -n "${{ secrets.CLOUDFLARE_TOKEN }}" ] && echo "CLOUDFLARE_TOKEN: present (alternate name exists)" || true
+          [ "$ok" = "1" ] || { echo "::error::No CLOUDFLARE_API_TOKEN secret on this repo — mirror it from the pageapp repo settings"; exit 1; }
+
+      - name: Deploy to Cloudflare Workers
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: a95ed0e200746822bed7037621cf256a
+          workingDirectory: lij-worker
+
+      - name: Smoke — invariants only (data-independent)
+        run: |
+          set -e
+          sleep 10   # S41: let the edge settle — first-ever deploy's smoke raced propagation and read a stale PoP
+          echo "— /health —"
+          H=$(curl -sf https://lij-worker.dp-a95.workers.dev/health)
+          echo "$H"; echo "$H" | grep -q '"ok":true'
+          echo "— /backup/challenge issues a nonce (KV binding alive) —"
+          C=$(curl -sf "https://lij-worker.dp-a95.workers.dev/backup/challenge?pubkey=aabb")
+          echo "$C" | grep -q '"nonce"'
+          echo "— unsigned register refused (S41 invariant: 403, nothing stored) —"
+          TS=$(date +%s)
+          CODE=$(curl -s -o /tmp/reg.json -w "%{http_code}" -X POST https://lij-worker.dp-a95.workers.dev/lsps/register -H 'Content-Type: application/json' -d "{\"name\":\"smoke\",\"pubkey\":\"020000000000000000000000000000000000000000000000000000000000000001\",\"endpoint\":\"https://smoke.invalid\",\"fee_ppm\":1,\"ts\":$TS,\"signature\":\"placeholder\"}")
+          cat /tmp/reg.json; echo; [ "$CODE" = "403" ]
+          echo "— unauth'd SCB push refused (S41 backup-arc invariant) —"
+          CODE2=$(curl -s -o /tmp/scb.json -w "%{http_code}" -X PUT https://lij-worker.dp-a95.workers.dev/lsp-backup --data-binary 'x')
+          cat /tmp/scb.json; echo; [ "$CODE2" = "400" ]
+          echo "— /lsps viability ordering + proofs-stripped invariants (retry x3 for edge settle) —"
+          ok=""
+          for i in 1 2 3; do
+          curl -sf https://lij-worker.dp-a95.workers.dev/lsps > /tmp/lsps.json || true
+          if python3 - <<'EOF'
+          import json
+          d = json.load(open('/tmp/lsps.json'))
+          lsps = d.get('lsps', [])
+          viable = lambda l: bool(l and l.get('wss_url') and not str(l.get('endpoint','')).lower().startswith('http://'))
+          flags = [viable(l) for l in lsps]
+          # invariant: no non-viable record may precede a viable one
+          assert flags == sorted(flags, reverse=True), 'viability ordering violated: %r' % flags
+          # S41 invariant: registration proofs are never served publicly
+          assert not any(('signature' in l) or ('ts' in l) for l in lsps), 'registration proofs served publicly'
+          print('lsps invariants OK:', [(l.get('name'), viable(l)) for l in lsps])
+          EOF
+          then ok=1; break; fi
+          echo "attempt $i not settled; retrying"; sleep 8
+          done
+          [ -n "$ok" ]
