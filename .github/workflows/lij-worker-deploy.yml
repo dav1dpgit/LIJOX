@@ -38,6 +38,7 @@ jobs:
         run: node test-register-sig.mjs
 
       - name: Diagnose — secret presence only (never values)
+        if: github.repository == 'dav1dpgit/lightning-in-a-jar'
         run: |
           ok=0
           [ -n "${{ secrets.CLOUDFLARE_API_TOKEN }}" ] && { echo "CLOUDFLARE_API_TOKEN: present"; ok=1; } || echo "CLOUDFLARE_API_TOKEN: MISSING"
@@ -46,6 +47,7 @@ jobs:
           [ "$ok" = "1" ] || { echo "::error::No CLOUDFLARE_API_TOKEN secret on this repo — mirror it from the pageapp repo settings"; exit 1; }
 
       - name: Deploy to Cloudflare Workers
+        if: github.repository == 'dav1dpgit/lightning-in-a-jar'
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -53,6 +55,7 @@ jobs:
           workingDirectory: lij-worker
 
       - name: Smoke — invariants only (data-independent)
+        if: github.repository == 'dav1dpgit/lightning-in-a-jar'
         run: |
           set -e
           sleep 10   # S41: let the edge settle — first-ever deploy's smoke raced propagation and read a stale PoP
