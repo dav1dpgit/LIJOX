@@ -7,7 +7,7 @@
 // cannot reach deploy. CI runs this before wrangler; a red here blocks.
 import * as secp from '@noble/secp256k1';
 import { createHmac, createHash, randomBytes } from 'node:crypto';
-import { canonicalRegisterMsg, verifyLndSignedRegistration, zbase32Decode, canonicalScbPush, canonicalScbGet } from './src/index.js';
+import { canonicalRegisterMsg, canonicalUnregisterMsg, verifyLndSignedRegistration, zbase32Decode, canonicalScbPush, canonicalScbGet } from './src/index.js';
 
 // noble v2 needs an hmac for RFC6979 signing (verify/recovery does not).
 secp.etc.hmacSha256Sync = (key, ...msgs) => {
@@ -141,6 +141,18 @@ t('non-zbase32 chars rejected', !(await verifyLndSignedRegistration(pub, workerM
   const get = canonicalScbGet(pub, ts);
   t('scb get canonical signs and verifies', await verifyLndSignedRegistration(pub, get, lndSign(priv, get)));
   t('scb get sig does not open push (domains separate)', !(await verifyLndSignedRegistration(pub, push, lndSign(priv, get))));
+}
+
+// ── lijox-unregister:v1 (0.6.0) — the departure canonical rides the same verify ─
+{
+  const ts = Math.floor(Date.now() / 1000);
+  const m = canonicalUnregisterMsg(pub, ts);
+  t('unregister canonical shape', m === `lijox-unregister:v1:${pub}:${ts}`);
+  t('unregister signs and verifies', await verifyLndSignedRegistration(pub, m, lndSign(priv, m)));
+  const sig = lndSign(priv, m);
+  t('unregister: tampered ts rejected', !(await verifyLndSignedRegistration(pub, canonicalUnregisterMsg(pub, ts + 1), sig)));
+  t('unregister: other key rejected', !(await verifyLndSignedRegistration(otherPub, m, sig)));
+  t('unregister sig does not open register (domains separate)', !(await verifyLndSignedRegistration(pub, canonicalRegisterMsg({ pubkey: pub, ts }), sig)));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

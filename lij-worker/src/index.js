@@ -115,6 +115,14 @@ function canonicalRegisterMsg(f) {
   return 'lijox-register:v1:' + fields.map(encodeURIComponent).join(':');
 }
 
+// 0.6.0 (S45, #6 registry hygiene): an LSP leaves the list with a signed
+// request. Canonical: pubkey + ts only; ts must be NEWER than the current
+// registration's ts, so a captured unregister cannot be replayed against a
+// later re-registration. Duplicated VERBATIM in lij-adapter.js.
+function canonicalUnregisterMsg(pubkey, ts) {
+  return 'lijox-unregister:v1:' + [String(pubkey), String(Number(ts) || 0)].map(encodeURIComponent).join(':');
+}
+
 // zbase32 (Tor/LND alphabet) — LND signmessage output encoding.
 const ZB32 = 'ybndrfg8ejkmcpqxot1uwisza345h769';
 function zbase32Decode(str) {
@@ -243,7 +251,7 @@ export default {
     // ── Health check ─────────────────────────────────────────────────────────
 
     if (path === '/health' && method === 'GET') {
-      return json({ ok: true, service: 'lij-worker' });
+      return json({ ok: true, service: 'lij-worker', version: '0.6.0' });
     }
 
     // ── LSP Registry ─────────────────────────────────────────────────────────
@@ -263,6 +271,13 @@ export default {
             // replay games inside the freshness window.
             delete rec.signature;
             delete rec.ts;
+            // 0.6.0: liveness fields. registered_at is rewritten on every (re-)registration,
+            // so it is "last seen"; stale = no registration for 24h. Wallets act on `stale`
+            // only once adapters re-register on a cadence (0.71.0) — until then it is
+            // informational.
+            rec.last_seen_ms = rec.registered_at || null;
+            rec.first_registered_at = rec.first_registered_at || rec.registered_at || null;
+            rec.stale = rec.registered_at ? (Date.now() - rec.registered_at) > 24 * 3600 * 1000 : false;
             lsps.push(rec);
           } catch (_) {}
         }
@@ -334,10 +349,16 @@ export default {
         route_macaroon: route_macaroon || null,
         wss_url: wss_url || null,
         uptime: 100,
-        registered_at: Date.now(),
+        registered_at: Date.now(),   // = last seen; adapters ≥0.71 re-register on a cadence
         ts: tsNum,
         signature,
       };
+      // 0.6.0: keep the first registration time across re-registrations ("listed since").
+      try {
+        const prev = await env.LIJ_KV.get(`lsp:${pubkey}`);
+        const prevRec = prev ? JSON.parse(prev) : null;
+        lsp.first_registered_at = (prevRec && prevRec.first_registered_at) || (prevRec && prevRec.registered_at) || lsp.registered_at;
+      } catch (_) { lsp.first_registered_at = lsp.registered_at; }
 
       // Canonical is built from the COERCED record — the signature vouches for
       // exactly what will be stored and served, not for raw request bytes.
@@ -349,6 +370,30 @@ export default {
 
       await env.LIJ_KV.put(`lsp:${pubkey}`, JSON.stringify(lsp));
       return json({ ok: true, pubkey });
+    }
+
+    // ── 0.6.0: POST /lsps/unregister — a signed departure (lijox-unregister:v1) ──
+    if (path === '/lsps/unregister' && method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch (_) { return err('body must be JSON'); }
+      const pubkey = String(body.pubkey || '').toLowerCase();
+      const ts = body.ts, signature = body.signature;
+      if (!pubkey || ts === undefined || !signature) return err('Missing required fields: pubkey, ts, signature');
+      const tsNum = Number(ts);
+      if (!Number.isFinite(tsNum) || Math.abs(Date.now() / 1000 - tsNum) > 600) {
+        return err('ts outside the 600s window', 403);
+      }
+      const existing = await env.LIJ_KV.get(`lsp:${pubkey}`);
+      if (!existing) return json({ ok: true, pubkey, removed: false });
+      let rec = null;
+      try { rec = JSON.parse(existing); } catch (_) {}
+      if (rec && Number.isFinite(Number(rec.ts)) && tsNum <= Number(rec.ts)) {
+        return err('unregister ts must be newer than the current registration', 403);
+      }
+      const ok = await verifyLndSignedRegistration(pubkey, canonicalUnregisterMsg(pubkey, tsNum), signature);
+      if (!ok) return err('signature does not verify for this pubkey', 403);
+      await env.LIJ_KV.delete(`lsp:${pubkey}`);
+      return json({ ok: true, pubkey, removed: true });
     }
 
     // ── LSP SCB backup — signed by the node key (lijox-scb:v1) ──────────────
@@ -521,4 +566,4 @@ export default {
 };
 // Named exports for the local sign\xe2\x86\x94verify gate (test-register-sig.mjs).
 // The Workers runtime uses only the default export; these are inert there.
-export { canonicalRegisterMsg, verifyLndSignedRegistration, zbase32Decode, canonicalScbPush, canonicalScbGet };
+export { canonicalRegisterMsg, canonicalUnregisterMsg, verifyLndSignedRegistration, zbase32Decode, canonicalScbPush, canonicalScbGet };

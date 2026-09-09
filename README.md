@@ -19,8 +19,9 @@ docs/                the protocol and design records (informal, written as they 
 
 | route | who calls it | what it does |
 |---|---|---|
-| `GET /lsps` | wallets | the registry: name, endpoint, WSS URL, fees, channel limits, capabilities per LSP. Signatures and timestamps are checked on the way in and stripped on the way out. |
+| `GET /lsps` | wallets | the registry: name, endpoint, WSS URL, fees, channel limits, capabilities per LSP, plus `last_seen_ms`, `first_registered_at` and `stale` (no registration for 24 h — adapters ≥0.71 re-register every 6 h). Signatures and timestamps are checked on the way in and stripped on the way out. |
 | `POST /lsps/register` | LSPs | `lijox-register:v1` — the LSP signs its full advertised field set plus a timestamp with its node key (LND `signmessage`); the worker verifies by public-key recovery, ±600 s. |
+| `POST /lsps/unregister` | LSPs | `lijox-unregister:v1` (0.6.0) — a signed departure (pubkey + ts); the ts must be newer than the current registration's, so a captured request cannot be replayed against a later re-registration. The record is deleted. |
 | `PUT` / `GET /lsp-backup` | LSPs | `lijox-scb:v1` — an LSP's own `channel.backup` (LND's seed-encrypted SCB), keyed and signed by its node key; latest + one previous generation, 5 MB cap. |
 | `GET /backup/challenge`, `POST /backup`, `POST /backup/fetch` | wallets | the wallet's sealed state blob: a single-use nonce is signed with the wallet's seed-derived portable key (compact ECDSA over a domain-separated sha256); versioned, latest wins. Contents are AES-GCM under a key only the seed produces; the worker sees a pubkey, a size and timing. |
 | `POST /names/claim`, `POST /names/release` | LSPs | `lijox-name:v1` — a Lightning address name at the neutral host, one LSP per name, signed with the LSP's node key. |
