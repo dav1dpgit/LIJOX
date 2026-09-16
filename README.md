@@ -24,6 +24,7 @@ docs/                the protocol and design records (informal, written as they 
 | `POST /lsps/unregister` | LSPs | `lijox-unregister:v1` (0.6.0) — a signed departure (pubkey + ts); the ts must be newer than the current registration's, so a captured request cannot be replayed against a later re-registration. The record is deleted. |
 | `PUT` / `GET /lsp-backup` | LSPs | `lijox-scb:v1` — an LSP's own `channel.backup` (LND's seed-encrypted SCB), keyed and signed by its node key; latest + one previous generation, 5 MB cap. |
 | `GET /backup/challenge`, `POST /backup`, `POST /backup/fetch` | wallets | the wallet's sealed state blob: a single-use nonce is signed with the wallet's seed-derived portable key (compact ECDSA over a domain-separated sha256); versioned, latest wins. Contents are AES-GCM under a key only the seed produces; the worker sees a pubkey, a size and timing. |
+| `POST /backup/forget` | wallets | (0.7.0) the wallet deletes its own sealed blob — the same signed single-use challenge (action `backup-forget`), so only the key that wrote the blob can remove it; idempotent. |
 | `POST /names/claim`, `POST /names/release` | LSPs | `lijox-name:v1` — a Lightning address name at the neutral host, one LSP per name, signed with the LSP's node key. |
 | `GET /.well-known/lnurlp/<name>` | payers | the neutral-host LNURL-pay lookup: returns the owning LSP's own answer unchanged (edge-cached 60 s); the payment callback goes straight to that LSP. |
 | `POST /lsps1/channel` | wallets | LSPS1 channel request relay (currently disabled server-side). |

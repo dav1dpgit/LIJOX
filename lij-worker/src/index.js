@@ -251,7 +251,7 @@ export default {
     // ── Health check ─────────────────────────────────────────────────────────
 
     if (path === '/health' && method === 'GET') {
-      return json({ ok: true, service: 'lij-worker', version: '0.6.0' });
+      return json({ ok: true, service: 'lij-worker', version: '0.7.0' });
     }
 
     // ── LSP Registry ─────────────────────────────────────────────────────────
@@ -554,6 +554,30 @@ export default {
         return json({ found: false }, 404);
       }
       return json({ found: true, blob: JSON.parse(raw) });
+    }
+
+    // 0.7.0 (S46, DP GO 2026-09-13): the wallet forgets its own cloud copy — the same
+    // signed challenge as push/read (action "backup-forget"), so only the key that
+    // wrote the blob can delete it. Idempotent: deleting nothing is still ok:true.
+    // (Erase on the phone is local-only; this is the other half — "off means off".)
+    if (path === '/backup/forget' && method === 'POST') {
+      let body;
+      try {
+        body = await request.json();
+      } catch (_) {
+        return err('Invalid JSON');
+      }
+      const { pubkey_hex, nonce, signature } = body;
+      if (!pubkey_hex || !nonce || !signature) {
+        return err('Missing pubkey_hex / nonce / signature');
+      }
+      if (!(await verifyBackupAuth(env, 'backup-forget', pubkey_hex, nonce, signature))) {
+        return err('Invalid signature or expired challenge', 401);
+      }
+      await env.LIJ_KV.delete(`bkpchal:${pubkey_hex}`);
+      const existed = !!(await env.LIJ_KV.get(`backup:${pubkey_hex}`));
+      await env.LIJ_KV.delete(`backup:${pubkey_hex}`);
+      return json({ ok: true, existed });
     }
 
     // ── LND Proxy ─────────────────────────────────────────────────────────────
