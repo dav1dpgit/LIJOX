@@ -6,7 +6,8 @@
 //   GET  /health              — health check
 //   GET  /lsps                — list registered LSPs ranked by score
 //   POST /lsps/register       — register an LSP node (lijox-register:v1 —
-//                               LND-signed over the full field set, ±600s ts)
+//                               LND-signed over the full field set, ±600s ts;
+//                               v2 when the record offers a block-filter server)
 //   PUT  /lsp-backup          — LSP pushes its own channel.backup (SCB),
 //                               node-key signed (lijox-scb:v1); GET restores
 //   POST /backup              — push encrypted wallet state (auth required)
@@ -101,6 +102,12 @@ async function verifyBackupAuth(env, action, pubkeyHex, nonce, sigHex) {
 //               max_channel_size_sats, supports_jit
 // Encodings:    strings as-is (null/undefined → ''), numbers as decimal
 //               strings (absent/NaN → '0'), booleans '1'/'0'. ts = unix secs.
+// 0.8.0 (S52, DP 2026-09-30 23:09 — each LIJOX provider may offer its own
+// block-filter server): a record that offers one is signed as
+// 'lijox-register:v2:' + the v1 fields + filter_url + filter_sp ('1'/'0'). A
+// record without one is signed as v1, byte for byte as before — adapters older
+// than 0.87.0 register unchanged. Stripping or adding filter_url changes the
+// prefix and the field list, so neither verifies against the other's signature.
 // This function is duplicated VERBATIM in lij-adapter.js (the signer). Any
 // change here changes there in the same release, or registration 403s.
 function canonicalRegisterMsg(f) {
@@ -112,7 +119,22 @@ function canonicalRegisterMsg(f) {
     n(f.fee_ppm), n(f.fee_base_sats), n(f.channel_open_fee_sats),
     n(f.max_channel_size_sats), (f.supports_jit ? '1' : '0'),
   ];
+  if (f.filter_url) {
+    return 'lijox-register:v2:' + fields.concat([s(f.filter_url), (f.filter_sp ? '1' : '0')]).map(encodeURIComponent).join(':');
+  }
   return 'lijox-register:v1:' + fields.map(encodeURIComponent).join(':');
+}
+
+// 0.8.0: a provider's block-filter server address — https only, a host, an
+// optional :port and path of URL-safe characters, no trailing '/', 200
+// characters at most (the wallet engine's clean_filter_base, v296, is the same
+// rule). Absent/empty → null; anything else that fails → undefined (refused).
+const FILTER_URL_RE = /^https:\/\/[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?(\/[A-Za-z0-9._~\/-]*)?$/;
+function cleanFilterUrl(v) {
+  if (v === undefined || v === null || v === '') return null;
+  const t = String(v);
+  if (t.length > 200 || t.endsWith('/') || !FILTER_URL_RE.test(t)) return undefined;
+  return t;
 }
 
 // 0.6.0 (S45, #6 registry hygiene): an LSP leaves the list with a signed
@@ -251,7 +273,7 @@ export default {
     // ── Health check ─────────────────────────────────────────────────────────
 
     if (path === '/health' && method === 'GET') {
-      return json({ ok: true, service: 'lij-worker', version: '0.7.0' });
+      return json({ ok: true, service: 'lij-worker', version: '0.8.0' });   // 0.8.0: filter_url / filter_sp
     }
 
     // ── LSP Registry ─────────────────────────────────────────────────────────
@@ -318,6 +340,7 @@ export default {
         name, pubkey, endpoint, fee_ppm,
         fee_base_sats, channel_open_fee_sats, max_channel_size_sats,
         supports_jit, route_endpoint, route_macaroon, wss_url, signature, ts,
+        filter_url, filter_sp,
       } = body;
 
       if (!name || !pubkey || !endpoint || fee_ppm === undefined || !signature || ts === undefined) {
@@ -335,6 +358,11 @@ export default {
       if (!Number.isFinite(tsNum) || Math.abs(Date.now() / 1000 - tsNum) > 600) {
         return err('ts outside the 600s registration window', 403);
       }
+      // 0.8.0: the optional block-filter server (+ whether it serves the silent-payment index)
+      const filterUrl = cleanFilterUrl(filter_url);
+      if (filterUrl === undefined) {
+        return err('filter_url must be a plain https:// address (a host, an optional :port and path, no trailing slash, 200 characters at most)');
+      }
 
       const lsp = {
         name,
@@ -348,6 +376,8 @@ export default {
         route_endpoint: route_endpoint || null,
         route_macaroon: route_macaroon || null,
         wss_url: wss_url || null,
+        filter_url: filterUrl,                              // 0.8.0: null = this provider offers none (wallets use the default)
+        filter_sp: filterUrl ? Boolean(filter_sp) : false,  // 0.8.0: its server serves the silent-payment index (/sp/info)
         uptime: 100,
         registered_at: Date.now(),   // = last seen; adapters ≥0.71 re-register on a cadence
         ts: tsNum,
@@ -590,4 +620,4 @@ export default {
 };
 // Named exports for the local sign\xe2\x86\x94verify gate (test-register-sig.mjs).
 // The Workers runtime uses only the default export; these are inert there.
-export { canonicalRegisterMsg, canonicalUnregisterMsg, verifyLndSignedRegistration, zbase32Decode, canonicalScbPush, canonicalScbGet };
+export { canonicalRegisterMsg, canonicalUnregisterMsg, verifyLndSignedRegistration, zbase32Decode, canonicalScbPush, canonicalScbGet, cleanFilterUrl };

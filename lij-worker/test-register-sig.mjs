@@ -7,7 +7,7 @@
 // cannot reach deploy. CI runs this before wrangler; a red here blocks.
 import * as secp from '@noble/secp256k1';
 import { createHmac, createHash, randomBytes } from 'node:crypto';
-import { canonicalRegisterMsg, canonicalUnregisterMsg, verifyLndSignedRegistration, zbase32Decode, canonicalScbPush, canonicalScbGet } from './src/index.js';
+import { canonicalRegisterMsg, canonicalUnregisterMsg, verifyLndSignedRegistration, zbase32Decode, canonicalScbPush, canonicalScbGet, cleanFilterUrl } from './src/index.js';
 
 // noble v2 needs an hmac for RFC6979 signing (verify/recovery does not).
 secp.etc.hmacSha256Sync = (key, ...msgs) => {
@@ -153,6 +153,36 @@ t('non-zbase32 chars rejected', !(await verifyLndSignedRegistration(pub, workerM
   t('unregister: tampered ts rejected', !(await verifyLndSignedRegistration(pub, canonicalUnregisterMsg(pub, ts + 1), sig)));
   t('unregister: other key rejected', !(await verifyLndSignedRegistration(otherPub, m, sig)));
   t('unregister sig does not open register (domains separate)', !(await verifyLndSignedRegistration(pub, canonicalRegisterMsg({ pubkey: pub, ts }), sig)));
+}
+
+// ── 0.8.0 (S52): lijox-register:v2 — a record that offers a block-filter server ─
+{
+  // a v1 record (no filter_url) signs exactly as the 0.7.0 canonical did — older adapters are unaffected
+  const v1Old = (f) => {
+    const s = (v) => (v === null || v === undefined) ? '' : String(v);
+    const n = (v) => String(Number(v) || 0);
+    return 'lijox-register:v1:' + [s(f.pubkey), n(f.ts), s(f.name), s(f.endpoint), s(f.wss_url), s(f.route_endpoint), s(f.route_macaroon),
+      n(f.fee_ppm), n(f.fee_base_sats), n(f.channel_open_fee_sats), n(f.max_channel_size_sats), (f.supports_jit ? '1' : '0')].map(encodeURIComponent).join(':');
+  };
+  t('v1 record: canonical byte-identical to 0.7.0', canonicalRegisterMsg(stored) === v1Old(stored));
+  t('v1 record with filter_url null stays v1', canonicalRegisterMsg({ ...stored, filter_url: null, filter_sp: false }) === v1Old(stored));
+  // the adapter's v2 body and the worker's stored record
+  const b2 = { ...body, filter_url: 'https://filters.example.org', filter_sp: true };
+  const m2 = canonicalRegisterMsg(b2);
+  const sig2 = lndSign(priv, m2);
+  const st2 = { ...stored, ts: Number(b2.ts), filter_url: cleanFilterUrl(b2.filter_url), filter_sp: Boolean(b2.filter_sp) };
+  t('v2 canonical prefix', m2.startsWith('lijox-register:v2:') && m2.endsWith(':' + encodeURIComponent('https://filters.example.org') + ':1'));
+  t('v2 adapter and worker canonicals are byte-identical', canonicalRegisterMsg(st2) === m2);
+  t('v2 signature verifies', await verifyLndSignedRegistration(pub, canonicalRegisterMsg(st2), sig2));
+  t('v2: tampered filter_url rejected', !(await verifyLndSignedRegistration(pub, canonicalRegisterMsg({ ...st2, filter_url: 'https://evil.example' }), sig2)));
+  t('v2: tampered filter_sp rejected', !(await verifyLndSignedRegistration(pub, canonicalRegisterMsg({ ...st2, filter_sp: false }), sig2)));
+  t('v2: stripping filter_url (downgrade to v1) rejected', !(await verifyLndSignedRegistration(pub, canonicalRegisterMsg({ ...st2, filter_url: null }), sig2)));
+  t('v1 signature cannot carry an added filter_url', !(await verifyLndSignedRegistration(pub, canonicalRegisterMsg({ ...stored, filter_url: 'https://evil.example', filter_sp: true }), signature)));
+  // the address rule (the engine's clean_filter_base, v296)
+  t('filter_url absent → null', cleanFilterUrl(undefined) === null && cleanFilterUrl('') === null && cleanFilterUrl(null) === null);
+  t('filter_url plain https kept', cleanFilterUrl('https://filters.example.org') === 'https://filters.example.org' && cleanFilterUrl('https://box.example.org:8443/lij/filters') === 'https://box.example.org:8443/lij/filters');
+  const bad = ['http://x.org', 'https://x.org/', 'https://', 'https://-x.org', 'https://a b.org', 'https://user@x.org', 'https://x.org?q=1', 'https://x.org/#f', 'https://x.org:port', 'https://x.org:123456', 'javascript:alert(1)', 'https://x.org/"onload', 'https://' + 'a'.repeat(200) + '.org'];
+  t('filter_url refused: ' + bad.length + ' bad shapes', bad.every((b) => cleanFilterUrl(b) === undefined));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
