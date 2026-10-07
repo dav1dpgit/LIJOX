@@ -25,6 +25,7 @@ docs/                the protocol and design records (informal, written as they 
 | `PUT` / `GET /lsp-backup` | LSPs | `lijox-scb:v1` — an LSP's own `channel.backup` (LND's seed-encrypted SCB), keyed and signed by its node key; latest + one previous generation, 5 MB cap. |
 | `GET /backup/challenge`, `POST /backup`, `POST /backup/fetch` | wallets | the wallet's sealed state blob: a single-use nonce is signed with the wallet's seed-derived portable key (compact ECDSA over a domain-separated sha256); versioned, latest wins. Contents are AES-GCM under a key only the seed produces; the worker sees a pubkey, a size and timing. |
 | `POST /backup/forget` | wallets | (0.7.0) the wallet deletes its own sealed blob — the same signed single-use challenge (action `backup-forget`), so only the key that wrote the blob can remove it; idempotent. |
+| `POST /backup/meta` | wallets | (0.9.0) the sealed copy's number and save date only, read from its unencrypted envelope — the same signed single-use challenge as `/backup/fetch` (action `backup-read`); `{found:false}` when no copy is held. A wallet compares the number with its own before it connects to its provider, without downloading the copy. |
 | `POST /names/claim`, `POST /names/release` | LSPs | `lijox-name:v1` — a Lightning address name at the neutral host, one LSP per name, signed with the LSP's node key. |
 | `GET /.well-known/lnurlp/<name>` | payers | the neutral-host LNURL-pay lookup: returns the owning LSP's own answer unchanged (edge-cached 60 s); the payment callback goes straight to that LSP. |
 | `POST /lsps1/channel` | wallets | LSPS1 channel request relay (currently disabled server-side). |
@@ -34,12 +35,15 @@ Canonical message formats are in `lij-worker/src/index.js` beside their verifier
 
 Two LSP-side routes the standard also names live in the adapter, not the worker: `POST /lsps/registry/recover-close` (a wallet back with only its 12 words asks its LSP to force-close every channel held under its node key; all-or-nothing while any HTLC is in flight) and the LNURL-pay rail (`/.well-known/lnurlp/<name>` at the LSP's own host, hold invoices minted on wallet-registered hashes; preimages never leave the wallet).
 
+One wallet, one open copy (`docs/lijox-copy-guard-standard.md`, adapter ≥0.93.0): every provider answers `POST /lsps/registry/my-channels` (a wallet, signing with its node key, reads back only its own channels — read-only) and tells a wallet when another copy of it is open at the same time (60-s window, sessions held in memory only). A wallet holding no record of a channel stops and asks its person before connecting, instead of connecting and letting the provider's LND force-close a channel that copy does not know.
+
 ## Documents
 
 - `docs/lijox-provider-definition.md` — what a LIJOX provider is and is not
 - `docs/lijox-interface-v0.md` — the wallet-side interface, postures, build order
 - `docs/openintent-v1.md` — Open-Intent v1 (channel-open intents)
 - `docs/static-address-model.md` — the LNURL-pay rail contract: seed-derived preimages, hash expiry, a pay code belongs to the wallet's current LSP, a definitive refusal ends the payment
+- `docs/lijox-copy-guard-standard.md` — one wallet, one open copy: the provider's part (my-channels; the 60-s open-copy window)
 - `docs/lijox-watchtower-note.md` — the reciprocal-watchtower obligation (ruled, not yet built)
 - `docs/design-22-lijox-sybil-ddos.md`, `docs/adapter-plain-terms.md`, `docs/lijox-manifest-arc-plan.md`
 

@@ -273,7 +273,7 @@ export default {
     // ── Health check ─────────────────────────────────────────────────────────
 
     if (path === '/health' && method === 'GET') {
-      return json({ ok: true, service: 'lij-worker', version: '0.8.0' });   // 0.8.0: filter_url / filter_sp
+      return json({ ok: true, service: 'lij-worker', version: '0.9.0' });   // 0.8.0: filter_url / filter_sp · 0.9.0: /backup/meta
     }
 
     // ── LSP Registry ─────────────────────────────────────────────────────────
@@ -584,6 +584,33 @@ export default {
         return json({ found: false }, 404);
       }
       return json({ found: true, blob: JSON.parse(raw) });
+    }
+
+    // 0.9.0 (S57, DP 2026-10-07 "Go with … 1"): the cloud copy's NUMBER AND DATE only. Before a wallet connects to its
+    // provider it compares the cloud's number with its own; a higher cloud number means another copy (or this phone
+    // before a reload) saved after it. /backup/fetch would send the whole sealed copy (~1.4 MB) to the phone at every
+    // unlock; this sends two numbers, read from the copy's unencrypted envelope. Same signed challenge as /backup/fetch
+    // (action "backup-read"); 200 {found:false} when no copy is held — a 404 means only that the route is missing.
+    if (path === '/backup/meta' && method === 'POST') {
+      let body;
+      try {
+        body = await request.json();
+      } catch (_) {
+        return err('Invalid JSON');
+      }
+      const { pubkey_hex, nonce, signature } = body;
+      if (!pubkey_hex || !nonce || !signature) {
+        return err('Missing pubkey_hex / nonce / signature');
+      }
+      if (!(await verifyBackupAuth(env, 'backup-read', pubkey_hex, nonce, signature))) {
+        return err('Invalid signature or expired challenge', 401);
+      }
+      await env.LIJ_KV.delete(`bkpchal:${pubkey_hex}`);
+      const raw = await env.LIJ_KV.get(`backup:${pubkey_hex}`);
+      if (!raw) return json({ found: false });
+      let b = {};
+      try { b = JSON.parse(raw) || {}; } catch (_) { b = {}; }
+      return json({ found: true, version: Number(b.version) || 0, saved_at_ms: Number(b.saved_at_ms) || 0 });
     }
 
     // 0.7.0 (S46, DP GO 2026-09-13): the wallet forgets its own cloud copy — the same

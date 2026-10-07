@@ -37,6 +37,10 @@ jobs:
         working-directory: lij-worker
         run: node test-register-sig.mjs
 
+      - name: Backup number-and-date gate (0.9.0, S57 — a red here blocks deploy)
+        working-directory: lij-worker
+        run: node test-backup-meta.mjs
+
       - name: Diagnose — secret presence only (never values)
         if: github.repository == 'dav1dpgit/lightning-in-a-jar'
         run: |
