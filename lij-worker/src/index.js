@@ -54,6 +54,24 @@ function hexToBytes(hex) {
   return out;
 }
 
+// 0.10.0: a copy's fingerprint — sha256 over its sealed bytes (`encrypted_data`, the engine's byte array), hex. The
+// engine takes the same hash of the same bytes before it uploads (lij-core storage::backup_fingerprint). null when the
+// copy carries no byte array (nothing to fingerprint — the copy is stored as before).
+async function blobFingerprint(blob) {
+  const d = blob && blob.encrypted_data;
+  if (!Array.isArray(d) || d.length === 0) return null;
+  const bytes = new Uint8Array(d.length);
+  for (let i = 0; i < d.length; i++) {
+    const v = d[i];
+    if (typeof v !== 'number' || !Number.isInteger(v) || v < 0 || v > 255) return null;
+    bytes[i] = v;
+  }
+  const h = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+  let out = '';
+  for (let i = 0; i < h.length; i++) out += h[i].toString(16).padStart(2, '0');
+  return out;
+}
+
 async function backupDigest(action, nonceHex, pubkeyHex) {
   const actionB = new TextEncoder().encode(action);
   const nonceB = hexToBytes(nonceHex);
@@ -273,7 +291,7 @@ export default {
     // ── Health check ─────────────────────────────────────────────────────────
 
     if (path === '/health' && method === 'GET') {
-      return json({ ok: true, service: 'lij-worker', version: '0.9.0' });   // 0.8.0: filter_url / filter_sp · 0.9.0: /backup/meta
+      return json({ ok: true, service: 'lij-worker', version: '0.10.0' });   // 0.8.0: filter_url / filter_sp · 0.9.0: /backup/meta · 0.10.0: the copy's fingerprint
     }
 
     // ── LSP Registry ─────────────────────────────────────────────────────────
@@ -545,9 +563,19 @@ export default {
         return err('blob pubkey_hex does not match authenticated pubkey', 400);
       }
 
+      // 0.10.0 (S57, DP 2026-10-08 14:40 "Agreed on the fix for the cloud copy fingerprint. Go"): the copy's FINGERPRINT —
+      // sha256 of its sealed bytes, the same the phone takes before it uploads — is kept with the copy and answered by
+      // /backup/meta, so a phone can tell its own upload (the OK never arrived: the app was put away mid-upload) from
+      // another copy's. A resend of the very same copy (same number, same fingerprint) is accepted again, not refused
+      // as stale: the phone's retry after a lost OK is then an OK, never a false conflict.
+      const fingerprint = await blobFingerprint(blob);
       const existing = await env.LIJ_KV.get(`backup:${pubkey_hex}`);
       if (existing) {
         const prev = JSON.parse(existing);
+        if (prev.version === blob.version && fingerprint && prev.fingerprint === fingerprint) {
+          await env.LIJ_KV.delete(`bkpchal:${pubkey_hex}`);
+          return json({ ok: true, version: blob.version, repeat: true, fingerprint });
+        }
         if (prev.version >= blob.version) {
           return err(
             `Stale backup rejected: existing v${prev.version} >= incoming v${blob.version}`,
@@ -556,9 +584,9 @@ export default {
         }
       }
 
-      await env.LIJ_KV.put(`backup:${pubkey_hex}`, JSON.stringify(blob));
+      await env.LIJ_KV.put(`backup:${pubkey_hex}`, JSON.stringify(fingerprint ? { ...blob, fingerprint } : blob));
       await env.LIJ_KV.delete(`bkpchal:${pubkey_hex}`);
-      return json({ ok: true, version: blob.version });
+      return json({ ok: true, version: blob.version, fingerprint });
     }
 
     // Authenticated read (POST so the signature travels in the body).
@@ -610,7 +638,9 @@ export default {
       if (!raw) return json({ found: false });
       let b = {};
       try { b = JSON.parse(raw) || {}; } catch (_) { b = {}; }
-      return json({ found: true, version: Number(b.version) || 0, saved_at_ms: Number(b.saved_at_ms) || 0 });
+      // 0.10.0: the stored copy's fingerprint rides along (null for a copy stored before 0.10.0)
+      const fp = (typeof b.fingerprint === 'string' && /^[0-9a-f]{64}$/.test(b.fingerprint)) ? b.fingerprint : null;
+      return json({ found: true, version: Number(b.version) || 0, saved_at_ms: Number(b.saved_at_ms) || 0, fingerprint: fp });
     }
 
     // 0.7.0 (S46, DP GO 2026-09-13): the wallet forgets its own cloud copy — the same
