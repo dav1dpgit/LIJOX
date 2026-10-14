@@ -59,7 +59,7 @@ r = await call('POST', '/backup/meta', await signed('backup-read'));
 check(r.json.found === true && r.json.version === 3 && r.json.saved_at_ms === 0, 'b6 a copy saved before v309: saved_at_ms 0');
 // b7 — the version on /health
 r = await call('GET', '/health');
-check(r.json && r.json.version === '0.10.0', 'b7 /health says 0.10.0');
+check(r.json && r.json.version === '0.11.0', 'b7 /health says 0.11.0');   // 0.11.0 (S58): the tatara block
 
 // 0.10.0 (S57, DP 2026-10-08 14:40 "Go" on the cloud-copy fingerprint)
 // b8 — a push keeps the copy's fingerprint (sha256 of its sealed bytes) and /backup/meta answers it

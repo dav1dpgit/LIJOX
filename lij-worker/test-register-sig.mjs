@@ -7,7 +7,8 @@
 // cannot reach deploy. CI runs this before wrangler; a red here blocks.
 import * as secp from '@noble/secp256k1';
 import { createHmac, createHash, randomBytes } from 'node:crypto';
-import { canonicalRegisterMsg, canonicalUnregisterMsg, verifyLndSignedRegistration, zbase32Decode, canonicalScbPush, canonicalScbGet, cleanFilterUrl } from './src/index.js';
+import worker from './src/index.js';
+import { canonicalRegisterMsg, canonicalUnregisterMsg, verifyLndSignedRegistration, zbase32Decode, canonicalScbPush, canonicalScbGet, cleanFilterUrl, cleanTatara, TATARA_FIELDS } from './src/index.js';
 
 // noble v2 needs an hmac for RFC6979 signing (verify/recovery does not).
 secp.etc.hmacSha256Sync = (key, ...msgs) => {
@@ -183,6 +184,80 @@ t('non-zbase32 chars rejected', !(await verifyLndSignedRegistration(pub, workerM
   t('filter_url plain https kept', cleanFilterUrl('https://filters.example.org') === 'https://filters.example.org' && cleanFilterUrl('https://box.example.org:8443/lij/filters') === 'https://box.example.org:8443/lij/filters');
   const bad = ['http://x.org', 'https://x.org/', 'https://', 'https://-x.org', 'https://a b.org', 'https://user@x.org', 'https://x.org?q=1', 'https://x.org/#f', 'https://x.org:port', 'https://x.org:123456', 'javascript:alert(1)', 'https://x.org/"onload', 'https://' + 'a'.repeat(200) + '.org'];
   t('filter_url refused: ' + bad.length + ' bad shapes', bad.every((b) => cleanFilterUrl(b) === undefined));
+}
+
+// ── 0.11.0 (S58, Tatara step 4): lijox-register:v3 — a record that offers Tatara pools (spec v0.10 §11.2) ─
+{
+  const T = {
+    v: 1, sizes: [50000, 100000, 250000, 1000000], min_people: 3, max_people: 6, countdown_s: 600, wake_window_s: 180,
+    max_retries: 2, strikes: 4, max_pools_per_size: 3, max_pools_total: 10, max_list_per_size: 60, max_fee_rate: 20,
+    channel_pools: true, channel_sizes: [250000, 1000000], relay_url: 'wss://lsp.example.org/tatara/relay',
+    relay_for_others: true, forward_payouts: true, forward_coin_checks: true, coin_check_url: 'https://filters.example.org/coin',
+    ring_hash: 'ab'.repeat(32),
+  };
+  const ct = cleanTatara(T);
+  t('v3: a full block is kept as sent', JSON.stringify(ct) === JSON.stringify(T));
+  t('v3: no block → null (v1/v2 records unchanged)', cleanTatara(undefined) === null && cleanTatara(null) === null);
+  const st3 = { ...stored, filter_url: 'https://filters.example.org', filter_sp: true, tatara: ct };
+  const m3 = canonicalRegisterMsg(st3);
+  const sig3 = lndSign(priv, m3);
+  t('v3 canonical prefix and field count (12 + 2 + ' + TATARA_FIELDS.length + ')', m3.startsWith('lijox-register:v3:') && m3.split(':').length === 2 + 12 + 2 + TATARA_FIELDS.length);
+  t('v3 tail: sizes comma-joined … ring hash last', m3.includes(':1:' + encodeURIComponent('50000,100000,250000,1000000') + ':3:6:600:180:2:4:3:10:60:20:1:' + encodeURIComponent('250000,1000000') + ':') && m3.endsWith(':' + 'ab'.repeat(32)));
+  t('v3 signature verifies', await verifyLndSignedRegistration(pub, m3, sig3));
+  const alt = { v: 1, sizes: [50000, 100000], min_people: 4, max_people: 5, countdown_s: 601, wake_window_s: 181, max_retries: 3, strikes: 5,
+    max_pools_per_size: 4, max_pools_total: 11, max_list_per_size: 61, max_fee_rate: 21, channel_pools: false, channel_sizes: [],
+    relay_url: 'wss://evil.example/r', relay_for_others: false, forward_payouts: false, forward_coin_checks: false, coin_check_url: null, ring_hash: 'cd'.repeat(32) };
+  let every = true;
+  for (const [k] of TATARA_FIELDS) {
+    if (k === 'v') continue;
+    const tam = { ...ct, [k]: alt[k] };
+    if (k === 'channel_pools') tam.channel_sizes = [];
+    if (await verifyLndSignedRegistration(pub, canonicalRegisterMsg({ ...st3, tatara: tam }), sig3)) { every = false; console.log('   (not caught: ' + k + ')'); }
+  }
+  t('v3: every tatara field is under the signature (' + (TATARA_FIELDS.length - 1) + ' tampered, each rejected)', every);
+  t('v3: stripping the block (downgrade to v2) rejected', !(await verifyLndSignedRegistration(pub, canonicalRegisterMsg({ ...st3, tatara: undefined }), sig3)));
+  t('v2 signature cannot carry an added block', !(await verifyLndSignedRegistration(pub, canonicalRegisterMsg({ ...stored, filter_url: 'https://filters.example.org', filter_sp: true, tatara: ct }), lndSign(priv, canonicalRegisterMsg({ ...stored, filter_url: 'https://filters.example.org', filter_sp: true })))));
+  const noFilter = canonicalRegisterMsg({ ...stored, tatara: ct });
+  t('v3 without a filter server: filter_url \'\' and filter_sp 0 in place', noFilter.startsWith('lijox-register:v3:') && noFilter.includes(':' + (stored.supports_jit ? '1' : '0') + '::0:1:'));
+  const bad = {
+    'an unknown key': { ...T, extra: 1 }, 'v 2': { ...T, v: 2 }, 'sizes unsorted': { ...T, sizes: [100000, 50000] },
+    'sizes repeated': { ...T, sizes: [50000, 50000] }, 'no sizes': { ...T, sizes: [] }, '13 sizes': { ...T, sizes: Array.from({ length: 13 }, (_, i) => 1000 * (i + 1)) },
+    'a size as a string': { ...T, sizes: ['50000'] }, 'a float': { ...T, countdown_s: 600.5 }, 'min > max': { ...T, min_people: 7 },
+    'a channel size not offered': { ...T, channel_sizes: [500000] }, 'channel sizes with channel pools off': { ...T, channel_pools: false },
+    'channel pools on, no sizes': { ...T, channel_sizes: [] }, 'a ws:// relay': { ...T, relay_url: 'ws://lsp.example.org/r' },
+    'an https relay': { ...T, relay_url: 'https://lsp.example.org/r' }, 'no relay': { ...T, relay_url: '' },
+    'an http coin check': { ...T, coin_check_url: 'http://x.org/c' }, 'an upper-case ring hash': { ...T, ring_hash: 'AB'.repeat(32) },
+    'a short ring hash': { ...T, ring_hash: 'ab' }, 'a boolean as 1': { ...T, forward_payouts: 1 }, 'a list as the block': [1, 2],
+    'retries 101': { ...T, max_retries: 101 }, 'fee cap 0': { ...T, max_fee_rate: 0 },
+  };
+  const missed = Object.entries(bad).filter(([, b]) => cleanTatara(b) !== undefined).map(([k]) => k);
+  t('v3: ' + Object.keys(bad).length + ' malformed blocks refused' + (missed.length ? ' — MISSED: ' + missed.join(', ') : ''), missed.length === 0);
+  // through the worker's own handler (in-memory KV): a v3 registration stored with its block; a malformed one refused;
+  // a v2 registration stored without a tatara key; a v3 record whose block was changed after signing refused
+  {
+    const kv = new Map();
+    const env = { LIJ_KV: { get: async (k) => (kv.has(k) ? kv.get(k) : null), put: async (k, v) => { kv.set(k, v); }, delete: async (k) => { kv.delete(k); }, list: async () => ({ keys: [] }) } };
+    const post = async (b) => { const r = await worker.fetch(new Request('https://lij-worker.test/lsps/register', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b) }), env, {}); let j = null; try { j = await r.json(); } catch (e) {} return { status: r.status, json: j }; };
+    const now = Math.floor(Date.now() / 1000);
+    const b3 = { ...body, ts: now, filter_url: 'https://filters.example.org', filter_sp: true, tatara: T };
+    const rec3 = { name: b3.name, pubkey: b3.pubkey, endpoint: b3.endpoint, fee_ppm: Number(b3.fee_ppm), fee_base_sats: Number(b3.fee_base_sats || 0), channel_open_fee_sats: Number(b3.channel_open_fee_sats || 0),
+      max_channel_size_sats: Number(b3.max_channel_size_sats || 0), supports_jit: Boolean(b3.supports_jit), route_endpoint: b3.route_endpoint || null, route_macaroon: b3.route_macaroon || null,
+      wss_url: b3.wss_url || null, filter_url: b3.filter_url, filter_sp: true, tatara: cleanTatara(T), ts: now };
+    b3.signature = lndSign(priv, canonicalRegisterMsg(rec3));
+    let r = await post(b3);
+    const kept = kv.get('lsp:' + pub) ? JSON.parse(kv.get('lsp:' + pub)) : null;
+    t('v3 through the handler: stored, its block as signed', r.status === 200 && kept && JSON.stringify(kept.tatara) === JSON.stringify(T));
+    r = await post({ ...b3, tatara: { ...T, max_fee_rate: 30 } });
+    t('v3 through the handler: a block changed after signing → 403', r.status === 403);
+    r = await post({ ...b3, tatara: { ...T, sizes: [100000, 50000] } });
+    t('v3 through the handler: a malformed block → 400, nothing stored over the good record', r.status === 400 && JSON.parse(kv.get('lsp:' + pub)).tatara.max_fee_rate === 20);
+    const b2 = { ...body, ts: now + 1, filter_url: 'https://filters.example.org', filter_sp: true };
+    const rec2 = { ...rec3, ts: now + 1 }; delete rec2.tatara;
+    b2.signature = lndSign(priv, canonicalRegisterMsg(rec2));
+    r = await post(b2);
+    t('v2 through the handler: stored with no tatara key (a provider that stops offering pools drops the block)', r.status === 200 && !('tatara' in JSON.parse(kv.get('lsp:' + pub))));
+  }
+  t('v3: no coin check and no ring yet → null, null', (() => { const c = cleanTatara({ ...T, coin_check_url: '', ring_hash: null }); return c && c.coin_check_url === null && c.ring_hash === null; })());
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

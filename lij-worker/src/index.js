@@ -126,6 +126,11 @@ async function verifyBackupAuth(env, action, pubkeyHex, nonce, sigHex) {
 // record without one is signed as v1, byte for byte as before — adapters older
 // than 0.87.0 register unchanged. Stripping or adding filter_url changes the
 // prefix and the field list, so neither verifies against the other's signature.
+// 0.11.0 (S58, LIJOX's Tatara step 4 — spec v0.10 §11.2): a record that offers Tatara pools is signed as
+// 'lijox-register:v3:' + the v1 fields + filter_url ('' when none) + filter_sp + the `tatara` block's fields in
+// TATARA_FIELDS order (lists comma-joined, booleans '1'/'0', absent strings ''). Records without the block sign as v1
+// or v2, byte for byte as before. Stripping, adding or changing the block changes the message, so none verifies
+// against another's signature.
 // This function is duplicated VERBATIM in lij-adapter.js (the signer). Any
 // change here changes there in the same release, or registration 403s.
 function canonicalRegisterMsg(f) {
@@ -137,6 +142,12 @@ function canonicalRegisterMsg(f) {
     n(f.fee_ppm), n(f.fee_base_sats), n(f.channel_open_fee_sats),
     n(f.max_channel_size_sats), (f.supports_jit ? '1' : '0'),
   ];
+  if (f.tatara) {
+    const t = f.tatara;
+    const tf = TATARA_FIELDS.map(([k, kind]) => kind === 'list' ? (t[k] || []).map((x) => n(x)).join(',')
+      : kind === 'bool' ? (t[k] ? '1' : '0') : kind === 'int' ? n(t[k]) : s(t[k]));
+    return 'lijox-register:v3:' + fields.concat([s(f.filter_url), (f.filter_sp ? '1' : '0')], tf).map(encodeURIComponent).join(':');
+  }
   if (f.filter_url) {
     return 'lijox-register:v2:' + fields.concat([s(f.filter_url), (f.filter_sp ? '1' : '0')]).map(encodeURIComponent).join(':');
   }
@@ -153,6 +164,49 @@ function cleanFilterUrl(v) {
   const t = String(v);
   if (t.length > 200 || t.endsWith('/') || !FILTER_URL_RE.test(t)) return undefined;
   return t;
+}
+
+// 0.11.0 (S58, Tatara step 4): the `tatara` block — the provider's pool settings, declared upfront and signed (spec
+// v0.10 §11). Field order is the canonical order. The registry refuses no provider for its policy (the LIJOX baseline;
+// the wallets decide): the checks here are of shape only, and every key must be one of these — nothing unsigned is
+// stored. Absent/null → null (no Tatara offered); a malformed block → undefined (refused).
+const TATARA_FIELDS = [
+  ['v', 'int'], ['sizes', 'list'], ['min_people', 'int'], ['max_people', 'int'], ['countdown_s', 'int'],
+  ['wake_window_s', 'int'], ['max_retries', 'int'], ['strikes', 'int'], ['max_pools_per_size', 'int'],
+  ['max_pools_total', 'int'], ['max_list_per_size', 'int'], ['max_fee_rate', 'int'], ['channel_pools', 'bool'],
+  ['channel_sizes', 'list'], ['relay_url', 'str'], ['relay_for_others', 'bool'], ['forward_payouts', 'bool'],
+  ['forward_coin_checks', 'bool'], ['coin_check_url', 'str'], ['ring_hash', 'str'],
+];
+const TATARA_LIMITS = {
+  v: [1, 1], min_people: [2, 100], max_people: [2, 100], countdown_s: [0, 86400], wake_window_s: [0, 86400],
+  max_retries: [0, 100], strikes: [1, 100], max_pools_per_size: [1, 1000], max_pools_total: [1, 10000],
+  max_list_per_size: [1, 100000], max_fee_rate: [1, 10000],
+};
+const RELAY_URL_RE = /^wss:\/\/[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?(\/[A-Za-z0-9._~\/-]*)?$/;
+function cleanTatara(v) {
+  if (v === undefined || v === null) return null;
+  if (typeof v !== 'object' || Array.isArray(v)) return undefined;
+  const known = new Set(TATARA_FIELDS.map(([k]) => k));
+  if (Object.keys(v).some((k) => !known.has(k))) return undefined;
+  const int = (x, lo, hi) => Number.isSafeInteger(x) && x >= lo && x <= hi;
+  const list = (a) => Array.isArray(a) && a.length <= 12 && a.every((x) => int(x, 1, 2100000000000000)) && a.every((x, i) => i === 0 || x > a[i - 1]);
+  const bool = (x) => x === true || x === false;
+  for (const [k, [lo, hi]] of Object.entries(TATARA_LIMITS)) if (!int(v[k], lo, hi)) return undefined;
+  if (v.min_people > v.max_people) return undefined;
+  if (!list(v.sizes) || v.sizes.length < 1) return undefined;
+  for (const k of ['channel_pools', 'relay_for_others', 'forward_payouts', 'forward_coin_checks']) if (!bool(v[k])) return undefined;
+  const ch = v.channel_sizes === undefined || v.channel_sizes === null ? [] : v.channel_sizes;
+  if (!list(ch) || (!v.channel_pools && ch.length) || (v.channel_pools && !ch.length) || ch.some((x) => !v.sizes.includes(x))) return undefined;
+  const relay = String(v.relay_url || '');
+  if (relay.length > 200 || relay.endsWith('/') || !RELAY_URL_RE.test(relay)) return undefined;
+  const coin = (v.coin_check_url === undefined || v.coin_check_url === null || v.coin_check_url === '') ? null : cleanFilterUrl(v.coin_check_url);
+  if (coin === undefined) return undefined;
+  const ring = (v.ring_hash === undefined || v.ring_hash === null || v.ring_hash === '') ? null : String(v.ring_hash);
+  if (ring !== null && !/^[0-9a-f]{64}$/.test(ring)) return undefined;
+  const out = {};
+  for (const [k] of TATARA_FIELDS) out[k] = v[k];
+  out.channel_sizes = ch; out.relay_url = relay; out.coin_check_url = coin; out.ring_hash = ring;
+  return out;
 }
 
 // 0.6.0 (S45, #6 registry hygiene): an LSP leaves the list with a signed
@@ -291,7 +345,7 @@ export default {
     // ── Health check ─────────────────────────────────────────────────────────
 
     if (path === '/health' && method === 'GET') {
-      return json({ ok: true, service: 'lij-worker', version: '0.10.0' });   // 0.8.0: filter_url / filter_sp · 0.9.0: /backup/meta · 0.10.0: the copy's fingerprint
+      return json({ ok: true, service: 'lij-worker', version: '0.11.0' });   // 0.8.0: filter_url / filter_sp · 0.9.0: /backup/meta · 0.10.0: the copy's fingerprint · 0.11.0: the tatara block (lijox-register:v3)
     }
 
     // ── LSP Registry ─────────────────────────────────────────────────────────
@@ -358,7 +412,7 @@ export default {
         name, pubkey, endpoint, fee_ppm,
         fee_base_sats, channel_open_fee_sats, max_channel_size_sats,
         supports_jit, route_endpoint, route_macaroon, wss_url, signature, ts,
-        filter_url, filter_sp,
+        filter_url, filter_sp, tatara,
       } = body;
 
       if (!name || !pubkey || !endpoint || fee_ppm === undefined || !signature || ts === undefined) {
@@ -381,6 +435,11 @@ export default {
       if (filterUrl === undefined) {
         return err('filter_url must be a plain https:// address (a host, an optional :port and path, no trailing slash, 200 characters at most)');
       }
+      // 0.11.0: the optional Tatara block (shape only; the wallets decide on the values)
+      const tat = cleanTatara(tatara);
+      if (tat === undefined) {
+        return err('tatara block malformed (known keys only; whole numbers within bounds; sizes ascending; channel sizes among the sizes; relay_url a plain wss:// address; coin_check_url a plain https:// address; ring_hash 64 lowercase hex)');
+      }
 
       const lsp = {
         name,
@@ -396,6 +455,7 @@ export default {
         wss_url: wss_url || null,
         filter_url: filterUrl,                              // 0.8.0: null = this provider offers none (wallets use the default)
         filter_sp: filterUrl ? Boolean(filter_sp) : false,  // 0.8.0: its server serves the silent-payment index (/sp/info)
+        ...(tat ? { tatara: tat } : {}),                    // 0.11.0: present only when offered (v1/v2 records keep their shape)
         uptime: 100,
         registered_at: Date.now(),   // = last seen; adapters ≥0.71 re-register on a cadence
         ts: tsNum,
@@ -677,4 +737,4 @@ export default {
 };
 // Named exports for the local sign\xe2\x86\x94verify gate (test-register-sig.mjs).
 // The Workers runtime uses only the default export; these are inert there.
-export { canonicalRegisterMsg, canonicalUnregisterMsg, verifyLndSignedRegistration, zbase32Decode, canonicalScbPush, canonicalScbGet, cleanFilterUrl };
+export { canonicalRegisterMsg, canonicalUnregisterMsg, verifyLndSignedRegistration, zbase32Decode, canonicalScbPush, canonicalScbGet, cleanFilterUrl, cleanTatara, TATARA_FIELDS };
