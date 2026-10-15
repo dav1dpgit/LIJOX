@@ -223,7 +223,8 @@ t('non-zbase32 chars rejected', !(await verifyLndSignedRegistration(pub, workerM
     'an unknown key': { ...T, extra: 1 }, 'v 2': { ...T, v: 2 }, 'sizes unsorted': { ...T, sizes: [100000, 50000] },
     'sizes repeated': { ...T, sizes: [50000, 50000] }, 'no sizes': { ...T, sizes: [] }, '13 sizes': { ...T, sizes: Array.from({ length: 13 }, (_, i) => 1000 * (i + 1)) },
     'a size as a string': { ...T, sizes: ['50000'] }, 'a float': { ...T, countdown_s: 600.5 }, 'min > max': { ...T, min_people: 7 },
-    'a channel size not offered': { ...T, channel_sizes: [500000] }, 'channel sizes with channel pools off': { ...T, channel_pools: false },
+    'channel sizes with channel pools off': { ...T, channel_pools: false },
+    'close sizes unsorted': { ...T, close_sizes: [500000, 400000] }, 'a close size as a string': { ...T, close_sizes: ['400000'] }, '13 close sizes': { ...T, close_sizes: Array.from({ length: 13 }, (_, i) => 1000 * (i + 1)) }, 'close sizes not a list': { ...T, close_sizes: 400000 },
     'channel pools on, no sizes': { ...T, channel_sizes: [] }, 'a ws:// relay': { ...T, relay_url: 'ws://lsp.example.org/r' },
     'an https relay': { ...T, relay_url: 'https://lsp.example.org/r' }, 'no relay': { ...T, relay_url: '' },
     'an http coin check': { ...T, coin_check_url: 'http://x.org/c' }, 'an upper-case ring hash': { ...T, ring_hash: 'AB'.repeat(32) },
@@ -258,6 +259,26 @@ t('non-zbase32 chars rejected', !(await verifyLndSignedRegistration(pub, workerM
     t('v2 through the handler: stored with no tatara key (a provider that stops offering pools drops the block)', r.status === 200 && !('tatara' in JSON.parse(kv.get('lsp:' + pub))));
   }
   t('v3: no coin check and no ring yet → null, null', (() => { const c = cleanTatara({ ...T, coin_check_url: '', ring_hash: null }); return c && c.coin_check_url === null && c.ring_hash === null; })());
+  // ── 0.12.0 / 0.12.1 (S59, DP item 20): the channel list is the provider's own; close_sizes came and went the same day ──
+  t('0.12.0: a channel size outside the on-chain sizes is allowed (the lists are the provider\'s own)', cleanTatara({ ...T, channel_sizes: [500000] }) !== undefined);
+  t('0.12.1: close_sizes is an unknown key — refused (no v4; the v3 message is 0.11.0\'s, byte for byte)', cleanTatara({ ...T, close_sizes: [400000] }) === undefined && cleanTatara({ ...T, close_sizes: [] }) === undefined && canonicalRegisterMsg(st3) === m3 && m3.startsWith('lijox-register:v3:'));
+  t('0.12.1: TATARA_FIELDS has no close_sizes', !TATARA_FIELDS.some(([k]) => k === 'close_sizes'));
+  {
+    const kv = new Map();
+    const env = { LIJ_KV: { get: async (k) => (kv.has(k) ? kv.get(k) : null), put: async (k, v) => { kv.set(k, v); }, delete: async (k) => { kv.delete(k); }, list: async () => ({ keys: [] }) } };
+    const post = async (b) => { const r = await worker.fetch(new Request('https://lij-worker.test/lsps/register', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b) }), env, {}); let j = null; try { j = await r.json(); } catch (e) {} return { status: r.status, json: j }; };
+    const now = Math.floor(Date.now() / 1000);
+    const Tc = { ...T, channel_sizes: [500000] };
+    const bc = { ...body, ts: now, filter_url: 'https://filters.example.org', filter_sp: true, tatara: Tc };
+    const recc = { name: bc.name, pubkey: bc.pubkey, endpoint: bc.endpoint, fee_ppm: Number(bc.fee_ppm), fee_base_sats: Number(bc.fee_base_sats || 0), channel_open_fee_sats: Number(bc.channel_open_fee_sats || 0),
+      max_channel_size_sats: Number(bc.max_channel_size_sats || 0), supports_jit: Boolean(bc.supports_jit), route_endpoint: bc.route_endpoint || null, route_macaroon: bc.route_macaroon || null,
+      wss_url: bc.wss_url || null, filter_url: bc.filter_url, filter_sp: true, tatara: cleanTatara(Tc), ts: now };
+    bc.signature = lndSign(priv, canonicalRegisterMsg(recc));
+    let r = await post(bc);
+    t('0.12.0 through the handler: a channel size outside the on-chain sizes is stored', r.status === 200 && JSON.stringify(JSON.parse(kv.get('lsp:' + pub)).tatara.channel_sizes) === '[500000]');
+    r = await post({ ...bc, tatara: { ...Tc, close_sizes: [400000] } });
+    t('0.12.1 through the handler: a block with close_sizes → 400 (unknown key)', r.status === 400);
+  }
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

@@ -131,6 +131,10 @@ async function verifyBackupAuth(env, action, pubkeyHex, nonce, sigHex) {
 // TATARA_FIELDS order (lists comma-joined, booleans '1'/'0', absent strings ''). Records without the block sign as v1
 // or v2, byte for byte as before. Stripping, adding or changing the block changes the message, so none verifies
 // against another's signature.
+// 0.12.0 (S59, DP 2026-10-14 — pools per route differently sized): the v3 rule "every channel size among the sizes" is
+// gone — the channel list is the provider's own. (0.12.0 also took a `close_sizes` list signed as v4; DP ruled the same
+// day that a channel's coin after its close sits in the on-chain pools, so 0.12.1 removed it — the message is v3 again,
+// byte for byte as 0.11.0 signed it; no record ever carried the key.)
 // This function is duplicated VERBATIM in lij-adapter.js (the signer). Any
 // change here changes there in the same release, or registration 403s.
 function canonicalRegisterMsg(f) {
@@ -196,7 +200,7 @@ function cleanTatara(v) {
   if (!list(v.sizes) || v.sizes.length < 1) return undefined;
   for (const k of ['channel_pools', 'relay_for_others', 'forward_payouts', 'forward_coin_checks']) if (!bool(v[k])) return undefined;
   const ch = v.channel_sizes === undefined || v.channel_sizes === null ? [] : v.channel_sizes;
-  if (!list(ch) || (!v.channel_pools && ch.length) || (v.channel_pools && !ch.length) || ch.some((x) => !v.sizes.includes(x))) return undefined;
+  if (!list(ch) || (!v.channel_pools && ch.length) || (v.channel_pools && !ch.length)) return undefined;   // 0.12.0: a channel size need not be an on-chain size
   const relay = String(v.relay_url || '');
   if (relay.length > 200 || relay.endsWith('/') || !RELAY_URL_RE.test(relay)) return undefined;
   const coin = (v.coin_check_url === undefined || v.coin_check_url === null || v.coin_check_url === '') ? null : cleanFilterUrl(v.coin_check_url);
@@ -345,7 +349,7 @@ export default {
     // ── Health check ─────────────────────────────────────────────────────────
 
     if (path === '/health' && method === 'GET') {
-      return json({ ok: true, service: 'lij-worker', version: '0.11.0' });   // 0.8.0: filter_url / filter_sp · 0.9.0: /backup/meta · 0.10.0: the copy's fingerprint · 0.11.0: the tatara block (lijox-register:v3)
+      return json({ ok: true, service: 'lij-worker', version: '0.12.1' });   // 0.8.0: filter_url / filter_sp · 0.9.0: /backup/meta · 0.10.0: the copy's fingerprint · 0.11.0: the tatara block (lijox-register:v3) · 0.12.0: the channel list its own · 0.12.1: close_sizes gone
     }
 
     // ── LSP Registry ─────────────────────────────────────────────────────────
@@ -438,7 +442,7 @@ export default {
       // 0.11.0: the optional Tatara block (shape only; the wallets decide on the values)
       const tat = cleanTatara(tatara);
       if (tat === undefined) {
-        return err('tatara block malformed (known keys only; whole numbers within bounds; sizes ascending; channel sizes among the sizes; relay_url a plain wss:// address; coin_check_url a plain https:// address; ring_hash 64 lowercase hex)');
+        return err('tatara block malformed (known keys only; whole numbers within bounds; sizes and channel sizes ascending; relay_url a plain wss:// address; coin_check_url a plain https:// address; ring_hash 64 lowercase hex)');
       }
 
       const lsp = {
