@@ -7,7 +7,8 @@
 //   GET  /lsps                — list registered LSPs ranked by score
 //   POST /lsps/register       — register an LSP node (lijox-register:v1 —
 //                               LND-signed over the full field set, ±600s ts;
-//                               v2 when the record offers a block-filter server)
+//                               v2 when the record offers a block-filter server;
+//                               v3 with a tatara block; v4 with a routes list)
 //   PUT  /lsp-backup          — LSP pushes its own channel.backup (SCB),
 //                               node-key signed (lijox-scb:v1); GET restores
 //   POST /backup              — push encrypted wallet state (auth required)
@@ -135,6 +136,15 @@ async function verifyBackupAuth(env, action, pubkeyHex, nonce, sigHex) {
 // gone — the channel list is the provider's own. (0.12.0 also took a `close_sizes` list signed as v4; DP ruled the same
 // day that a channel's coin after its close sits in the on-chain pools, so 0.12.1 removed it — the message is v3 again,
 // byte for byte as 0.11.0 signed it; no record ever carried the key.)
+// 0.13.0 (S61, DP 2026-10-19 14:54 — Step A, "both routes"; docs/design/routes/routes-r1.md §2): a record that carries
+// a `routes` list is signed as 'lijox-register:v4:' + the v1 fields + filter_url ('' when none) + filter_sp + the
+// tatara block's fields in TATARA_FIELDS order ('' / '0' for every field when no block is offered) + ONE field holding
+// every route as reach|endpoint|wss_url|filter_url, routes joined by ';' (the '|' and ';' are inside the field and
+// percent-encoded with it). A route's `reach` is the operator's signed word for what sits between the wallet and the
+// box: direct (TLS ends on the operator's own machine), cloudflare (Cloudflare's edge ends TLS), tor (a slot). The
+// first route repeats the top-level endpoint / wss_url / filter_url, so a v3 reader sees the operator's first choice.
+// Records without routes sign as v1/v2/v3, byte for byte as before. (0.12.0's one-day 'v4' carried close_sizes and
+// was retired by 0.12.1 the same day; no record ever carried it, so the prefix is free.)
 // This function is duplicated VERBATIM in lij-adapter.js (the signer). Any
 // change here changes there in the same release, or registration 403s.
 function canonicalRegisterMsg(f) {
@@ -146,6 +156,13 @@ function canonicalRegisterMsg(f) {
     n(f.fee_ppm), n(f.fee_base_sats), n(f.channel_open_fee_sats),
     n(f.max_channel_size_sats), (f.supports_jit ? '1' : '0'),
   ];
+  if (f.routes && f.routes.length) {
+    const t = f.tatara || {};
+    const tf = TATARA_FIELDS.map(([k, kind]) => kind === 'list' ? (t[k] || []).map((x) => n(x)).join(',')
+      : kind === 'bool' ? (t[k] ? '1' : '0') : kind === 'int' ? n(t[k]) : s(t[k]));
+    const rf = f.routes.map((r) => [s(r.reach), s(r.endpoint), s(r.wss_url), s(r.filter_url)].join('|')).join(';');
+    return 'lijox-register:v4:' + fields.concat([s(f.filter_url), (f.filter_sp ? '1' : '0')], tf, [rf]).map(encodeURIComponent).join(':');
+  }
   if (f.tatara) {
     const t = f.tatara;
     const tf = TATARA_FIELDS.map(([k, kind]) => kind === 'list' ? (t[k] || []).map((x) => n(x)).join(',')
@@ -210,6 +227,35 @@ function cleanTatara(v) {
   const out = {};
   for (const [k] of TATARA_FIELDS) out[k] = v[k];
   out.channel_sizes = ch; out.relay_url = relay; out.coin_check_url = coin; out.ring_hash = ring;
+  return out;
+}
+
+// 0.13.0 (S61, Step A): the `routes` list — every door into the same provider, in the operator's order of preference.
+// Shape only (the registry refuses no provider for its policy): 1–3 routes; each exactly {reach, endpoint, wss_url,
+// filter_url}; reach one of the three words; endpoint a plain https:// address and wss_url a plain wss:// address (the
+// filter_url rule: a host, an optional :port and path, no trailing '/', 200 characters at most); filter_url by
+// cleanFilterUrl (absent/'' → null: that route reads the default filter server); no two routes with the same endpoint.
+// Absent/null → null (a one-door record, v1/v2/v3); malformed → undefined (refused). The first route must repeat the
+// record's own endpoint / wss_url / filter_url — the handler checks that, not this function.
+const ROUTE_REACH = ['direct', 'cloudflare', 'tor'];
+const ROUTE_KEYS = ['reach', 'endpoint', 'wss_url', 'filter_url'];
+function cleanRoutes(v) {
+  if (v === undefined || v === null) return null;
+  if (!Array.isArray(v) || v.length < 1 || v.length > 3) return undefined;
+  const out = [];
+  for (const r of v) {
+    if (!r || typeof r !== 'object' || Array.isArray(r)) return undefined;
+    if (Object.keys(r).some((k) => !ROUTE_KEYS.includes(k))) return undefined;
+    if (!ROUTE_REACH.includes(r.reach)) return undefined;
+    const ep = cleanFilterUrl(r.endpoint);                       // the same https address rule
+    if (!ep) return undefined;                                    // null (absent) or undefined (bad) — both refused
+    const ws = String(r.wss_url || '');
+    if (ws.length > 200 || ws.endsWith('/') || !RELAY_URL_RE.test(ws)) return undefined;
+    const fu = cleanFilterUrl(r.filter_url);
+    if (fu === undefined) return undefined;
+    if (out.some((o) => o.endpoint === ep)) return undefined;
+    out.push({ reach: r.reach, endpoint: ep, wss_url: ws, filter_url: fu });
+  }
   return out;
 }
 
@@ -349,7 +395,7 @@ export default {
     // ── Health check ─────────────────────────────────────────────────────────
 
     if (path === '/health' && method === 'GET') {
-      return json({ ok: true, service: 'lij-worker', version: '0.12.1' });   // 0.8.0: filter_url / filter_sp · 0.9.0: /backup/meta · 0.10.0: the copy's fingerprint · 0.11.0: the tatara block (lijox-register:v3) · 0.12.0: the channel list its own · 0.12.1: close_sizes gone
+      return json({ ok: true, service: 'lij-worker', version: '0.13.0' });   // 0.8.0: filter_url / filter_sp · 0.9.0: /backup/meta · 0.10.0: the copy's fingerprint · 0.11.0: the tatara block (lijox-register:v3) · 0.12.0: the channel list its own · 0.12.1: close_sizes gone · 0.13.0: the routes list (lijox-register:v4)
     }
 
     // ── LSP Registry ─────────────────────────────────────────────────────────
@@ -416,7 +462,7 @@ export default {
         name, pubkey, endpoint, fee_ppm,
         fee_base_sats, channel_open_fee_sats, max_channel_size_sats,
         supports_jit, route_endpoint, route_macaroon, wss_url, signature, ts,
-        filter_url, filter_sp, tatara,
+        filter_url, filter_sp, tatara, routes,
       } = body;
 
       if (!name || !pubkey || !endpoint || fee_ppm === undefined || !signature || ts === undefined) {
@@ -444,6 +490,14 @@ export default {
       if (tat === undefined) {
         return err('tatara block malformed (known keys only; whole numbers within bounds; sizes and channel sizes ascending; relay_url a plain wss:// address; coin_check_url a plain https:// address; ring_hash 64 lowercase hex)');
       }
+      // 0.13.0: the optional routes list (shape only); its first route must repeat the record's own three addresses
+      const rts = cleanRoutes(routes);
+      if (rts === undefined) {
+        return err('routes malformed (1–3 routes; each exactly {reach, endpoint, wss_url, filter_url}; reach direct|cloudflare|tor; endpoint a plain https:// address; wss_url a plain wss:// address; filter_url a plain https:// address or empty; no two routes with the same endpoint)');
+      }
+      if (rts && (rts[0].endpoint !== endpoint || rts[0].wss_url !== (wss_url || null) || rts[0].filter_url !== filterUrl)) {
+        return err('routes[0] must repeat the record\'s endpoint, wss_url and filter_url (the operator\'s first choice is what older wallets read)');
+      }
 
       const lsp = {
         name,
@@ -460,6 +514,7 @@ export default {
         filter_url: filterUrl,                              // 0.8.0: null = this provider offers none (wallets use the default)
         filter_sp: filterUrl ? Boolean(filter_sp) : false,  // 0.8.0: its server serves the silent-payment index (/sp/info)
         ...(tat ? { tatara: tat } : {}),                    // 0.11.0: present only when offered (v1/v2 records keep their shape)
+        ...(rts ? { routes: rts } : {}),                    // 0.13.0: present only when sent (one-door records keep their shape)
         uptime: 100,
         registered_at: Date.now(),   // = last seen; adapters ≥0.71 re-register on a cadence
         ts: tsNum,
@@ -741,4 +796,4 @@ export default {
 };
 // Named exports for the local sign\xe2\x86\x94verify gate (test-register-sig.mjs).
 // The Workers runtime uses only the default export; these are inert there.
-export { canonicalRegisterMsg, canonicalUnregisterMsg, verifyLndSignedRegistration, zbase32Decode, canonicalScbPush, canonicalScbGet, cleanFilterUrl, cleanTatara, TATARA_FIELDS };
+export { canonicalRegisterMsg, canonicalUnregisterMsg, verifyLndSignedRegistration, zbase32Decode, canonicalScbPush, canonicalScbGet, cleanFilterUrl, cleanTatara, cleanRoutes, TATARA_FIELDS, ROUTE_REACH };

@@ -8,7 +8,7 @@
 import * as secp from '@noble/secp256k1';
 import { createHmac, createHash, randomBytes } from 'node:crypto';
 import worker from './src/index.js';
-import { canonicalRegisterMsg, canonicalUnregisterMsg, verifyLndSignedRegistration, zbase32Decode, canonicalScbPush, canonicalScbGet, cleanFilterUrl, cleanTatara, TATARA_FIELDS } from './src/index.js';
+import { canonicalRegisterMsg, canonicalUnregisterMsg, verifyLndSignedRegistration, zbase32Decode, canonicalScbPush, canonicalScbGet, cleanFilterUrl, cleanTatara, cleanRoutes, TATARA_FIELDS, ROUTE_REACH } from './src/index.js';
 
 // noble v2 needs an hmac for RFC6979 signing (verify/recovery does not).
 secp.etc.hmacSha256Sync = (key, ...msgs) => {
@@ -278,6 +278,94 @@ t('non-zbase32 chars rejected', !(await verifyLndSignedRegistration(pub, workerM
     t('0.12.0 through the handler: a channel size outside the on-chain sizes is stored', r.status === 200 && JSON.stringify(JSON.parse(kv.get('lsp:' + pub)).tatara.channel_sizes) === '[500000]');
     r = await post({ ...bc, tatara: { ...Tc, close_sizes: [400000] } });
     t('0.12.1 through the handler: a block with close_sizes → 400 (unknown key)', r.status === 400);
+  }
+}
+
+
+// ── 0.13.0 (S61, Step A): lijox-register:v4 — a record that carries a routes list (routes-r1 §2) ─────────────────────
+{
+  const R = [
+    { reach: 'direct', endpoint: 'https://direct-lsp.example.org', wss_url: 'wss://direct-ws.example.org', filter_url: 'https://direct-filters.example.org' },
+    { reach: 'cloudflare', endpoint: 'https://lsp.example.org', wss_url: 'wss://ws.example.org', filter_url: 'https://filters.example.org' },
+  ];
+  const cr = cleanRoutes(R);
+  t('v4: a two-route list is kept as sent', JSON.stringify(cr) === JSON.stringify(R));
+  t('v4: no list → null (v1/v2/v3 records unchanged)', cleanRoutes(undefined) === null && cleanRoutes(null) === null);
+  t('v4: a route without a filter server reads null', (() => { const c = cleanRoutes([{ ...R[0], filter_url: '' }]); return c && c[0].filter_url === null; })());
+  t('v4: the three reach words', JSON.stringify(ROUTE_REACH) === '["direct","cloudflare","tor"]');
+  // the stored record: the top-level addresses are route 1's (the handler enforces it)
+  const st4 = { ...stored, endpoint: R[0].endpoint, wss_url: R[0].wss_url, filter_url: R[0].filter_url, filter_sp: true, routes: cr };
+  const m4 = canonicalRegisterMsg(st4);
+  const sig4 = lndSign(priv, m4);
+  t('v4 canonical prefix and field count (12 + 2 + ' + TATARA_FIELDS.length + ' + 1)', m4.startsWith('lijox-register:v4:') && m4.split(':').length === 2 + 12 + 2 + TATARA_FIELDS.length + 1);
+  const rf = encodeURIComponent(R.map((r) => [r.reach, r.endpoint, r.wss_url, r.filter_url].join('|')).join(';'));
+  t('v4 tail: the routes as one percent-encoded field, last', m4.endsWith(':' + rf) && rf.includes('%7C') && rf.includes('%3B'));
+  const T0 = TATARA_FIELDS.map(([, kind]) => kind === 'list' ? '' : kind === 'str' ? '' : '0').join(':');
+  t('v4 without a tatara block: every block field in place as \'\' / \'0\'', m4.includes(':' + encodeURIComponent(R[0].filter_url) + ':1:' + T0 + ':' + rf));
+  t('v4 signature verifies', await verifyLndSignedRegistration(pub, m4, sig4));
+  const tampers = [
+    ['reach of route 1', (x) => ({ ...x, routes: [{ ...x.routes[0], reach: 'cloudflare' }, x.routes[1]] })],
+    ['endpoint of route 2', (x) => ({ ...x, routes: [x.routes[0], { ...x.routes[1], endpoint: 'https://evil.example' }] })],
+    ['wss_url of route 2', (x) => ({ ...x, routes: [x.routes[0], { ...x.routes[1], wss_url: 'wss://evil.example' }] })],
+    ['filter_url of route 1', (x) => ({ ...x, routes: [{ ...x.routes[0], filter_url: 'https://evil.example' }, x.routes[1]] })],
+    ['a route dropped', (x) => ({ ...x, routes: [x.routes[0]] })],
+    ['a route added', (x) => ({ ...x, routes: x.routes.concat([{ reach: 'tor', endpoint: 'https://t.example.org', wss_url: 'wss://t.example.org', filter_url: null }]) })],
+    ['the routes swapped', (x) => ({ ...x, routes: [x.routes[1], x.routes[0]] })],
+    ['the list stripped (downgrade to v2)', (x) => ({ ...x, routes: undefined })],
+  ];
+  let every = true;
+  for (const [name, f] of tampers) {
+    if (await verifyLndSignedRegistration(pub, canonicalRegisterMsg(f(st4)), sig4)) { every = false; console.log('   (not caught: ' + name + ')'); }
+  }
+  t('v4: every route field, count and order is under the signature (' + tampers.length + ' tampered, each rejected)', every);
+  t('v2 signature cannot carry an added routes list', !(await verifyLndSignedRegistration(pub, canonicalRegisterMsg({ ...st4, filter_sp: true }), lndSign(priv, canonicalRegisterMsg({ ...st4, routes: undefined })))));
+  // with a tatara block too: v4 carries the block's fields before the routes
+  const T4 = { v: 1, sizes: [50000, 100000], min_people: 3, max_people: 6, countdown_s: 600, wake_window_s: 180, max_retries: 2, strikes: 4, max_pools_per_size: 3,
+    max_pools_total: 10, max_list_per_size: 60, max_fee_rate: 20, channel_pools: true, channel_sizes: [100000], relay_url: 'wss://lsp.example.org/tatara/relay',
+    relay_for_others: true, forward_payouts: true, forward_coin_checks: true, coin_check_url: 'https://filters.example.org/coin', ring_hash: 'ab'.repeat(32) };
+  const st4t = { ...st4, tatara: cleanTatara(T4) };
+  const m4t = canonicalRegisterMsg(st4t);
+  t('v4 with a tatara block: prefix v4, the block then the routes', m4t.startsWith('lijox-register:v4:') && m4t.includes(':' + encodeURIComponent('50000,100000') + ':3:6:') && m4t.endsWith(':' + 'ab'.repeat(32) + ':' + rf));
+  t('v4 with a block: a tampered block field rejected', !(await verifyLndSignedRegistration(pub, canonicalRegisterMsg({ ...st4t, tatara: { ...st4t.tatara, max_fee_rate: 21 } }), lndSign(priv, m4t))));
+  const bad = {
+    'an empty list': [], 'four routes': [R[0], R[1], { ...R[0], endpoint: 'https://a.example.org' }, { ...R[0], endpoint: 'https://b.example.org' }],
+    'an unknown word': [{ ...R[0], reach: 'vpn' }], 'no reach': [{ endpoint: R[0].endpoint, wss_url: R[0].wss_url, filter_url: null }],
+    'an extra key': [{ ...R[0], note: 'x' }], 'an http endpoint': [{ ...R[0], endpoint: 'http://x.example.org' }],
+    'a trailing slash': [{ ...R[0], endpoint: 'https://x.example.org/' }], 'no endpoint': [{ ...R[0], endpoint: '' }],
+    'a ws:// link': [{ ...R[0], wss_url: 'ws://x.example.org' }], 'no wss_url': [{ ...R[0], wss_url: '' }],
+    'an http filter_url': [{ ...R[0], filter_url: 'http://x.example.org' }], 'two routes, one endpoint': [R[0], { ...R[1], endpoint: R[0].endpoint }],
+    'a string as the list': 'direct', 'an object as the list': { reach: 'direct' }, 'a route that is a list': [[1, 2]],
+  };
+  const missed = Object.entries(bad).filter(([, b]) => cleanRoutes(b) !== undefined).map(([k]) => k);
+  t('v4: ' + Object.keys(bad).length + ' malformed lists refused' + (missed.length ? ' — MISSED: ' + missed.join(', ') : ''), missed.length === 0);
+  // through the handler (in-memory KV): stored with its routes; routes[0] not repeating the record's addresses → 400;
+  // a route changed after signing → 403; a one-door record stores with no routes key; GET /lsps serves routes as stored
+  {
+    const kv = new Map();
+    const env = { LIJ_KV: { get: async (k) => (kv.has(k) ? kv.get(k) : null), put: async (k, v) => { kv.set(k, v); }, delete: async (k) => { kv.delete(k); }, list: async () => ({ keys: Array.from(kv.keys()).filter((k) => k.startsWith('lsp:')).map((name) => ({ name })) }) } };
+    const post = async (b) => { const r = await worker.fetch(new Request('https://lij-worker.test/lsps/register', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b) }), env, {}); let j = null; try { j = await r.json(); } catch (e) {} return { status: r.status, json: j }; };
+    const now = Math.floor(Date.now() / 1000);
+    const b4 = { ...body, ts: now, endpoint: R[0].endpoint, route_endpoint: R[0].endpoint, wss_url: R[0].wss_url, filter_url: R[0].filter_url, filter_sp: true, routes: R };
+    const rec4 = { name: b4.name, pubkey: b4.pubkey, endpoint: b4.endpoint, fee_ppm: Number(b4.fee_ppm), fee_base_sats: 0, channel_open_fee_sats: 0, max_channel_size_sats: 0,
+      supports_jit: Boolean(b4.supports_jit), route_endpoint: b4.route_endpoint, route_macaroon: b4.route_macaroon, wss_url: b4.wss_url, filter_url: b4.filter_url, filter_sp: true, routes: cleanRoutes(R), ts: now };
+    b4.signature = lndSign(priv, canonicalRegisterMsg(rec4));
+    let r = await post(b4);
+    const kept = kv.get('lsp:' + pub) ? JSON.parse(kv.get('lsp:' + pub)) : null;
+    t('v4 through the handler: stored, its routes as signed', r.status === 200 && kept && JSON.stringify(kept.routes) === JSON.stringify(R));
+    r = await post({ ...b4, routes: [{ ...R[0], reach: 'cloudflare' }, R[1]] });
+    t('v4 through the handler: a route changed after signing → 403', r.status === 403);
+    r = await post({ ...b4, routes: [R[1], R[0]] });
+    t('v4 through the handler: routes[0] not the record\'s own addresses → 400', r.status === 400 && /routes\[0\]/.test(r.json && r.json.error || ''));
+    r = await post({ ...b4, routes: [{ ...R[0], reach: 'vpn' }] });
+    t('v4 through the handler: a malformed list → 400, the good record untouched', r.status === 400 && JSON.parse(kv.get('lsp:' + pub)).routes.length === 2);
+    const g = await worker.fetch(new Request('https://lij-worker.test/lsps'), env, {});
+    const gl = (await g.json()).lsps;
+    t('GET /lsps serves the routes as stored (signature and ts stripped as before)', g.status === 200 && gl.length === 1 && JSON.stringify(gl[0].routes) === JSON.stringify(R) && !('signature' in gl[0]) && !('ts' in gl[0]));
+    const b3 = { ...body, ts: now + 1, filter_url: 'https://filters.example.org', filter_sp: true };
+    const rec3 = { ...rec4, ts: now + 1, endpoint: b3.endpoint, route_endpoint: b3.route_endpoint, wss_url: b3.wss_url, filter_url: b3.filter_url }; delete rec3.routes;
+    b3.signature = lndSign(priv, canonicalRegisterMsg(rec3));
+    r = await post(b3);
+    t('a one-door record through the handler: stored with no routes key (an older adapter re-registering drops the list)', r.status === 200 && !('routes' in JSON.parse(kv.get('lsp:' + pub))));
   }
 }
 
