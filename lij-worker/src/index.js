@@ -15,6 +15,9 @@
 //   GET  /backup/:pubkey      — pull encrypted wallet state (auth required)
 
 import * as secp from '@noble/secp256k1';
+// 0.17.0 (S63, Phase C): the rules the two doors of the registry share — the clock on every write, the tombstone on
+// every delete, the record guards, the mirror's signed message (src/mirror.js; the box imports the same file)
+import { clockedStore, mirrorable, clockOf, recordAllows, mirrorMsg, sha256Hex, MIRROR_TS_WINDOW_S, TOMB_PREFIX, TOMB_TTL_S } from './mirror.js';
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -35,6 +38,46 @@ function json(data, status = 200) {
 
 function err(msg, status = 400) {
   return json({ error: msg }, status);
+}
+
+// 0.16.0 (S63, Kimi round 2 K3/K8 — DP's numbers): THE RATE LIMIT, per client address, through a Workers rate-limit
+// binding (approximate, per Cloudflare location). RL_REGISTER 60/min on the registry writes; RL_WRITE 300/min on the
+// other write routes. No binding (the tests' env) → nothing is limited.
+async function rateLimited(env, bindingName, request) {
+  const rl = env && env[bindingName];
+  if (!rl || typeof rl.limit !== 'function') return null;
+  const ip = String(request.headers.get('cf-connecting-ip') || request.headers.get('x-real-ip') || 'unknown');
+  let ok = true;
+  try { const r = await rl.limit({ key: bindingName + ':' + ip }); ok = !r || r.success !== false; } catch (_) { ok = true; }   // a binding error never refuses a wallet
+  return ok ? null : err('too many requests from this address — try again in a minute', 429);
+}
+// 0.14.0 (K8): the body's declared size, checked BEFORE it is read (a missing header passes — the post-read checks stay)
+function tooLarge(request, cap) {
+  const len = Number(request.headers.get('content-length'));
+  return Number.isFinite(len) && len > cap;
+}
+// 0.14.0 (K3): a KV listing that follows its cursor and reads in bulk (100 keys an operation) — the old loop stopped at
+// KV's first page and spent one operation per record
+async function kvGetMany(env, names) {
+  const out = new Map();
+  for (let i = 0; i < names.length; i += 100) {
+    const chunk = names.slice(i, i + 100);
+    let got = null;
+    try { got = await env.LIJ_KV.get(chunk); } catch (_) { got = null; }
+    if (got && typeof got.get === 'function') { for (const n of chunk) out.set(n, got.get(n) ?? null); }
+    else { for (const n of chunk) out.set(n, await env.LIJ_KV.get(n)); }
+  }
+  return out;
+}
+async function kvListAll(env, prefix, cap = 5000) {
+  const names = []; let cursor = undefined;
+  for (let page = 0; page < 50; page++) {
+    const r = await env.LIJ_KV.list(cursor ? { prefix, cursor } : { prefix });
+    for (const k of (r.keys || [])) { names.push(k.name); if (names.length >= cap) return names; }
+    if (r.list_complete !== false || !r.cursor) break;
+    cursor = r.cursor;
+  }
+  return names;
 }
 
 // ── Signed-challenge auth for /backup ───────────────────────────────────────
@@ -93,7 +136,8 @@ async function backupDigest(action, nonceHex, pubkeyHex) {
 // digest. Single-use: the challenge is deleted on success by the caller.
 async function verifyBackupAuth(env, action, pubkeyHex, nonce, sigHex) {
   if (!pubkeyHex || !nonce || !sigHex) return false;
-  const stored = await env.LIJ_KV.get(`bkpchal:${pubkeyHex}`);
+  if (typeof nonce !== 'string' || !/^[0-9a-f]{64}$/.test(nonce)) return false;
+  const stored = await env.LIJ_KV.get(`bkpchal:${pubkeyHex}:${nonce}`);   // 0.14.0 (K4): keyed by nonce — nobody overwrites another wallet's open challenge
   if (!stored || stored !== nonce) return false;
   const digest = await backupDigest(action, nonce, pubkeyHex);
   const sig = hexToBytes(sigHex);
@@ -323,7 +367,12 @@ async function sha256HexOf(bytes) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env0) {
+    // 0.17.0 (Phase C): every write this request makes carries the request's clock, and a delete leaves a tombstone —
+    // the other door of the registry (the box) reads both to keep the two stores level. The routes below see the
+    // wrapped store; the mirror routes alone read and write the raw one with the clocks they are handed.
+    const rawKv = env0 && env0.LIJ_KV;
+    const env = rawKv ? Object.assign({}, env0, { LIJ_KV: clockedStore(rawKv, Date.now()) }) : env0;
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method;
@@ -343,8 +392,9 @@ export default {
     // edge, so this worker sees cache misses, not payers; the callback inside
     // that answer points at the LSP, never here.
     const NAME_RE = /^[a-z0-9_-]{2,32}$/;
-    const nameMsg = (kind, name, pk, ts) => 'lijox-name:v1:' + [kind, name, pk, String(Number(ts) || 0)].map(encodeURIComponent).join(':');
-    const nameAuth = async (body, kind) => {
+    // 0.15.0 (K1): the transfer op's message carries the NEW LSP's pubkey as a fifth part — `transfer:<name>:<oldpk>:<ts>:<newpk>`
+    const nameMsg = (kind, name, pk, ts, extra) => 'lijox-name:v1:' + [kind, name, pk, String(Number(ts) || 0)].concat(extra !== undefined ? [extra] : []).map(encodeURIComponent).join(':');
+    const nameAuth = async (body, kind, extra) => {
       const name = String(body && body.name || '').toLowerCase();
       const pk = String(body && body.lsp_pubkey || '').toLowerCase();
       const ts = Number(body && body.ts);
@@ -352,11 +402,13 @@ export default {
       const pkb = hexToBytes(pk); if (!pkb || pkb.length !== 33) return { e: err('bad lsp_pubkey') };
       if (!Number.isFinite(ts) || Math.abs(Date.now() / 1000 - ts) > 600) return { e: err('ts outside window', 403) };
       if (!(await env.LIJ_KV.get(`lsp:${pk}`))) return { e: err('unknown LSP', 403) };
-      const ok = await verifyLndSignedRegistration(pk, nameMsg(kind, name, pk, ts), String(body.signature || ''));
+      const ok = await verifyLndSignedRegistration(pk, nameMsg(kind, name, pk, ts, extra), String(body.signature || ''));
       if (!ok) return { e: err('signature does not verify', 403) };
       return { name, pk };
     };
     if (path === '/names/claim' && method === 'POST') {
+      { const lim = await rateLimited(env, 'RL_WRITE', request); if (lim) return lim; }   // 0.16.0: 300/min per address
+      if (tooLarge(request, 64 * 1024)) return err('body exceeds the 64 KB cap', 413);   // 0.14.0 (K8)
       let body; try { body = await request.json(); } catch (_) { return err('Invalid JSON'); }
       const a = await nameAuth(body, 'claim'); if (a.e) return a.e;
       const cur = await env.LIJ_KV.get(`name:${a.name}`, 'json');
@@ -364,7 +416,27 @@ export default {
       if (!cur) await env.LIJ_KV.put(`name:${a.name}`, JSON.stringify({ lsp_pubkey: a.pk, claimed_at: Date.now() }));
       return json({ ok: true, name: a.name, lsp_pubkey: a.pk, existed: !!cur });
     }
+    // 0.15.0 (S63, Kimi round 2 K1 — DP "Agreed"): the signed TRANSFER. The old LSP hands the name to the new one in
+    // one put — no free interval in which any registered LSP could take it. The old LSP signs the new LSP's pubkey;
+    // the new LSP must be registered here; the name must be the old LSP's (an unheld name is simply claimed for the
+    // new one). A later /names/claim by the new LSP answers existed:true.
+    if (path === '/names/transfer' && method === 'POST') {
+      { const lim = await rateLimited(env, 'RL_WRITE', request); if (lim) return lim; }   // 0.16.0: 300/min per address
+      if (tooLarge(request, 64 * 1024)) return err('body exceeds the 64 KB cap', 413);
+      let body; try { body = await request.json(); } catch (_) { return err('Invalid JSON'); }
+      const to = String(body && body.to_lsp_pubkey || '').toLowerCase();
+      const tob = hexToBytes(to); if (!tob || tob.length !== 33 || !/^[0-9a-f]{66}$/.test(to)) return err('bad to_lsp_pubkey');
+      const a = await nameAuth(body, 'transfer', to); if (a.e) return a.e;
+      if (to === a.pk) return err('to_lsp_pubkey is the signer', 400);
+      if (!(await env.LIJ_KV.get(`lsp:${to}`))) return err('unknown LSP (to)', 403);
+      const cur = await env.LIJ_KV.get(`name:${a.name}`, 'json');
+      if (cur && cur.lsp_pubkey !== a.pk) return err('not yours', 403);
+      await env.LIJ_KV.put(`name:${a.name}`, JSON.stringify({ lsp_pubkey: to, claimed_at: Date.now(), transferred_from: a.pk, transferred_at: Date.now() }));
+      return json({ ok: true, name: a.name, lsp_pubkey: to, from: a.pk, existed: !!cur });
+    }
     if (path === '/names/release' && method === 'POST') {
+      { const lim = await rateLimited(env, 'RL_WRITE', request); if (lim) return lim; }   // 0.16.0: 300/min per address
+      if (tooLarge(request, 64 * 1024)) return err('body exceeds the 64 KB cap', 413);   // 0.14.0 (K8)
       let body; try { body = await request.json(); } catch (_) { return err('Invalid JSON'); }
       const a = await nameAuth(body, 'release'); if (a.e) return a.e;
       const cur = await env.LIJ_KV.get(`name:${a.name}`, 'json');
@@ -384,28 +456,113 @@ export default {
       const lsp = await env.LIJ_KV.get(`lsp:${rec.lsp_pubkey}`, 'json');
       if (!lsp || !lsp.endpoint) return json({ status: 'ERROR', reason: 'LSP unavailable' }, 503);
       let up;
-      try { up = await fetch(String(lsp.endpoint).replace(/\/+$/, '') + '/.well-known/lnurlp/' + name, { cf: { cacheTtl: 0 } }); }
+      // 0.14.0 (K7): no redirect followed (the provider's answer comes from the address it registered, nowhere else) and
+      // at most 64 KB of it read. 0.17.1: `redirect: 'manual'` — Workers does not implement the Fetch standard's 'error'
+      // mode (a TypeError the moment the Request is built, before anything is sent); 0.14.0–0.17.0 answered 502 "LSP
+      // unreachable" to EVERY lookup on Cloudflare for it (DP, 23:06). A 3xx answer is refused here instead.
+      try { up = await fetch(String(lsp.endpoint).replace(/\/+$/, '') + '/.well-known/lnurlp/' + name, { cf: { cacheTtl: 0 }, redirect: 'manual' }); }
       catch (_) { return json({ status: 'ERROR', reason: 'LSP unreachable' }, 502); }
-      const text = await up.text();
+      if (up.status >= 300 && up.status < 400) return json({ status: 'ERROR', reason: 'LSP unreachable' }, 502);   // a redirect is not an answer
+      let text = '';
+      try {
+        const reader = up.body && up.body.getReader ? up.body.getReader() : null;
+        if (!reader) text = await up.text();
+        else {
+          const parts = []; let total = 0;
+          for (;;) { const { done, value } = await reader.read(); if (done) break; total += value.length; if (total > 64 * 1024) { try { await reader.cancel(); } catch (_) {} return json({ status: 'ERROR', reason: 'LSP answer too large' }, 502); } parts.push(value); }
+          text = new TextDecoder().decode(parts.length === 1 ? parts[0] : parts.reduce((a, p) => { const o = new Uint8Array(a.length + p.length); o.set(a); o.set(p, a.length); return o; }, new Uint8Array(0)));
+        }
+      } catch (_) { return json({ status: 'ERROR', reason: 'LSP unreachable' }, 502); }
       const out = new Response(text, { status: up.status, headers: { ...CORS, 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=60' } });
       if (up.status === 200) { try { await cache.put(cacheKey, out.clone()); } catch (_) {} }
       return out;
     }
 
+    // ── 0.17.0 (S63, Phase C): THE MIRROR — the box's side of the registry drives it (src/mirror.js) ──────────
+    // The listing with clocks, one key's bytes, a put and a delete that apply only when newer. Signed by the box's
+    // own key (LIJ_MIRROR_PUBKEY, a wrangler var — empty until the box's first boot prints its pubkey → 503). No
+    // rate limit: the one key is the admission; an unsigned call is refused before any store access.
+    if (path.startsWith('/mirror/')) {
+      const pub = String((env0 && env0.LIJ_MIRROR_PUBKEY) || '').toLowerCase();
+      if (!/^[0-9a-f]{66}$/.test(pub)) return err('mirror not configured', 503);
+      if (!rawKv) return err('no store', 503);
+      const ts = Number(request.headers.get('x-lij-mirror-ts'));
+      const sigHex = String(request.headers.get('x-lij-mirror-sig') || '');
+      if (!Number.isFinite(ts) || Math.abs(Date.now() / 1000 - ts) > MIRROR_TS_WINDOW_S) return err('mirror ts outside window', 403);
+      const bodyBytes = method === 'POST' ? new Uint8Array(await request.arrayBuffer()) : new Uint8Array(0);
+      const msg = mirrorMsg(method, url.pathname + url.search, ts, await sha256Hex(bodyBytes));
+      const msgDigest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(msg)));
+      const sig = hexToBytes(sigHex), pk = hexToBytes(pub);
+      let okSig = false;
+      try { okSig = !!(sig && sig.length === 64 && pk && secp.verify(sig, msgDigest, pk)); } catch (_) { okSig = false; }
+      if (!okSig) return err('mirror signature does not verify', 403);
+      const getMeta = async (k, type) => (typeof rawKv.getWithMetadata === 'function' ? rawKv.getWithMetadata(k, type) : { value: await rawKv.get(k, type), metadata: null });
+      const present = (g) => !!(g && g.value !== null && g.value !== undefined);
+      if (path === '/mirror/keys' && method === 'GET') {
+        const cursor = url.searchParams.get('cursor') || undefined;
+        const r = await rawKv.list(cursor ? { cursor, limit: 1000 } : { limit: 1000 });
+        const keys = [];
+        for (const k of (r.keys || [])) {
+          if (!mirrorable(k.name)) continue;
+          keys.push({ name: k.name, c: clockOf(k.metadata), exp: Number.isFinite(Number(k.expiration)) && Number(k.expiration) > 0 ? Number(k.expiration) : null });
+        }
+        return json({ keys, cursor: (r.list_complete === false && r.cursor) ? r.cursor : null });
+      }
+      const key = String(url.searchParams.get('key') || '');
+      if (!mirrorable(key) || key.length > 300) return err('bad key');
+      if (path === '/mirror/get' && method === 'GET') {
+        const got = await getMeta(key, 'arrayBuffer');
+        if (!present(got)) return err('no such key', 404);
+        return new Response(got.value, { status: 200, headers: { 'Content-Type': 'application/octet-stream', 'x-lij-clock': String(clockOf(got.metadata)), ...CORS } });
+      }
+      const clock = Number(url.searchParams.get('clock'));
+      if (!Number.isFinite(clock) || clock <= 0) return err('bad clock');
+      if (path === '/mirror/put' && method === 'POST') {
+        if (key.startsWith(TOMB_PREFIX)) return err('a tombstone is written by /mirror/delete');
+        const cur = await getMeta(key, 'arrayBuffer');
+        const stored = present(cur) ? new Uint8Array(cur.value) : null;
+        if (stored && clockOf(cur.metadata) >= clock) return json({ ok: true, applied: false, reason: 'stored is as new or newer' });
+        const tomb = await getMeta(TOMB_PREFIX + key);
+        if (present(tomb) && clockOf(tomb.metadata) >= clock) return json({ ok: true, applied: false, reason: 'deleted later' });
+        if (!recordAllows(key, bodyBytes, stored)) return json({ ok: true, applied: false, reason: 'the record rule' });
+        const exp = Number(url.searchParams.get('expiration'));
+        const opts = { metadata: { c: clock } };
+        if (Number.isFinite(exp) && exp > 0) {
+          if (exp < Date.now() / 1000 + 60) return json({ ok: true, applied: false, reason: 'expiring' });   // KV refuses an expiry under a minute away
+          opts.expiration = Math.floor(exp);
+        }
+        await rawKv.put(key, bodyBytes, opts);
+        return json({ ok: true, applied: true });
+      }
+      if (path === '/mirror/delete' && method === 'POST') {
+        if (key.startsWith(TOMB_PREFIX)) return err('bad key');
+        const cur = await getMeta(key, 'arrayBuffer');
+        const has = present(cur);
+        if (has && clockOf(cur.metadata) >= clock) return json({ ok: true, applied: false, reason: 'stored is as new or newer' });
+        const tomb = await getMeta(TOMB_PREFIX + key);
+        if (present(tomb) && clockOf(tomb.metadata) >= clock) return json({ ok: true, applied: false, reason: 'already' });
+        if (has) await rawKv.delete(key);
+        try { await rawKv.put(TOMB_PREFIX + key, '1', { expirationTtl: TOMB_TTL_S, metadata: { c: clock } }); } catch (_) {}
+        return json({ ok: true, applied: true, existed: !!has });
+      }
+      return err('Not found', 404);
+    }
+
     // ── Health check ─────────────────────────────────────────────────────────
 
     if (path === '/health' && method === 'GET') {
-      return json({ ok: true, service: 'lij-worker', version: '0.13.0' });   // 0.8.0: filter_url / filter_sp · 0.9.0: /backup/meta · 0.10.0: the copy's fingerprint · 0.11.0: the tatara block (lijox-register:v3) · 0.12.0: the channel list its own · 0.12.1: close_sizes gone · 0.13.0: the routes list (lijox-register:v4)
+      return json({ ok: true, service: 'lij-worker', version: '0.17.1' });   // 0.8.0: filter_url / filter_sp · 0.9.0: /backup/meta · 0.10.0: the copy's fingerprint · 0.11.0: the tatara block (lijox-register:v3) · 0.12.0: the channel list its own · 0.12.1: close_sizes gone · 0.13.0: the routes list (lijox-register:v4) · 0.14.0: Kimi round 2 — the shape rules, the cursor, the per-nonce challenge, the freshness rules, the caps · 0.15.0: the signed name transfer (K1), cacheTtl 30 on the backup reads (K2), /lsps1/channel retired (K11) · 0.16.0: the per-address rate limit (K3/K8 — 60/min registry writes, 300/min the other writes) · 0.17.0: Phase C — the clock on every write, the tombstone on every delete, the signed /mirror/* routes for the box's door · 0.17.1: the lnurlp lookup's redirect mode 'manual' (Workers throws on 'error' — every lookup answered 502 from 0.14.0 to 0.17.0)
     }
 
     // ── LSP Registry ─────────────────────────────────────────────────────────
 
     if (path === '/lsps' && method === 'GET') {
-      const keys = await env.LIJ_KV.list({ prefix: 'lsp:' });
+      const names = await kvListAll(env, 'lsp:');   // 0.14.0 (K3): every page, read in bulk
+      const got = await kvGetMany(env, names);
       const lsps = [];
 
-      for (const key of keys.keys) {
-        const raw = await env.LIJ_KV.get(key.name);
+      for (const name of names) {
+        const raw = got.get(name);
         if (raw) {
           try {
             const rec = JSON.parse(raw);
@@ -448,6 +605,8 @@ export default {
     }
 
     if (path === '/lsps/register' && method === 'POST') {
+      { const lim = await rateLimited(env, 'RL_REGISTER', request); if (lim) return lim; }   // 0.16.0: 60/min per address
+      if (tooLarge(request, 16 * 1024)) return err('body exceeds the 16 KB cap', 413);   // 0.14.0 (K8)
       let body;
       try {
         body = await request.json();
@@ -476,10 +635,21 @@ export default {
       if (!pk || pk.length !== 33) {
         return err('pubkey must be 33-byte compressed hex');
       }
+      if (!/^[0-9a-f]{66}$/.test(String(pubkey))) {
+        return err('pubkey must be 66 lowercase hex');   // 0.14.0 (K10): one identity per key — an uppercase spelling made a second record nothing could unregister
+      }
       const tsNum = Number(ts);
       if (!Number.isFinite(tsNum) || Math.abs(Date.now() / 1000 - tsNum) > 600) {
         return err('ts outside the 600s registration window', 403);
       }
+      // 0.14.0 (K3): the stored fields have a shape — a name of at most 64 characters, plain https addresses of at most
+      // 200 for endpoint and route_endpoint, a plain wss address for wss_url, a route token of at most 256 characters.
+      // Refuses no LND registrant: an http endpoint cannot serve an https wallet page at all (mixed content).
+      if (typeof name !== 'string' || name.length < 1 || name.length > 64) return err('name must be 1–64 characters');
+      if (typeof endpoint !== 'string' || endpoint.length > 200 || endpoint.endsWith('/') || !FILTER_URL_RE.test(endpoint)) return err('endpoint must be a plain https:// address (a host, an optional :port and path, no trailing slash, 200 characters at most)');
+      if (route_endpoint !== undefined && route_endpoint !== null && route_endpoint !== '' && (typeof route_endpoint !== 'string' || route_endpoint.length > 200 || route_endpoint.endsWith('/') || !FILTER_URL_RE.test(route_endpoint))) return err('route_endpoint must be a plain https:// address (200 characters at most)');
+      if (wss_url !== undefined && wss_url !== null && wss_url !== '' && (typeof wss_url !== 'string' || wss_url.length > 200 || wss_url.endsWith('/') || !RELAY_URL_RE.test(wss_url))) return err('wss_url must be a plain wss:// address (200 characters at most)');
+      if (route_macaroon !== undefined && route_macaroon !== null && (typeof route_macaroon !== 'string' || route_macaroon.length > 256)) return err('route_macaroon must be a string of at most 256 characters');
       // 0.8.0: the optional block-filter server (+ whether it serves the silent-payment index)
       const filterUrl = cleanFilterUrl(filter_url);
       if (filterUrl === undefined) {
@@ -521,11 +691,20 @@ export default {
         signature,
       };
       // 0.6.0: keep the first registration time across re-registrations ("listed since").
+      let prevTs = null;
       try {
         const prev = await env.LIJ_KV.get(`lsp:${pubkey}`);
         const prevRec = prev ? JSON.parse(prev) : null;
         lsp.first_registered_at = (prevRec && prevRec.first_registered_at) || (prevRec && prevRec.registered_at) || lsp.registered_at;
+        if (prevRec && Number.isFinite(Number(prevRec.ts))) prevTs = Number(prevRec.ts);
       } catch (_) { lsp.first_registered_at = lsp.registered_at; }
+      // 0.14.0 (K5): a captured registration cannot roll the record back — older than the stored one is refused (strict:
+      // the adapter may register twice in one second); an unregister's tombstone (20 min) must be outdone too
+      if (prevTs !== null && tsNum < prevTs) return err('older than the current record', 409);
+      try {
+        const gone = await env.LIJ_KV.get(`lspgone:${pubkey}`);
+        if (gone !== null && Number.isFinite(Number(gone)) && tsNum <= Number(gone)) return err('older than this key\'s departure', 409);
+      } catch (_) {}
 
       // Canonical is built from the COERCED record — the signature vouches for
       // exactly what will be stored and served, not for raw request bytes.
@@ -541,6 +720,8 @@ export default {
 
     // ── 0.6.0: POST /lsps/unregister — a signed departure (lijox-unregister:v1) ──
     if (path === '/lsps/unregister' && method === 'POST') {
+      { const lim = await rateLimited(env, 'RL_REGISTER', request); if (lim) return lim; }   // 0.16.0: 60/min per address
+      if (tooLarge(request, 64 * 1024)) return err('body exceeds the 64 KB cap', 413);   // 0.14.0 (K8)
       let body;
       try { body = await request.json(); } catch (_) { return err('body must be JSON'); }
       const pubkey = String(body.pubkey || '').toLowerCase();
@@ -560,11 +741,13 @@ export default {
       const ok = await verifyLndSignedRegistration(pubkey, canonicalUnregisterMsg(pubkey, tsNum), signature);
       if (!ok) return err('signature does not verify for this pubkey', 403);
       await env.LIJ_KV.delete(`lsp:${pubkey}`);
+      try { await env.LIJ_KV.put(`lspgone:${pubkey}`, String(tsNum), { expirationTtl: 1200 }); } catch (_) {}   // 0.14.0 (K5): the tombstone a captured older registration cannot outdo
       return json({ ok: true, pubkey, removed: true });
     }
 
     // ── LSP SCB backup — signed by the node key (lijox-scb:v1) ──────────────
     if (path === '/lsp-backup' && (method === 'PUT' || method === 'GET')) {
+      if (method === 'PUT') { const lim = await rateLimited(env, 'RL_WRITE', request); if (lim) return lim; }   // 0.16.0: 300/min per address (the GET is a read)
       const pubkey = String(request.headers.get('x-lij-pubkey') || '').toLowerCase();
       const ts = Number(request.headers.get('x-lij-ts'));
       const sig = request.headers.get('x-lij-sig') || '';
@@ -578,6 +761,7 @@ export default {
       }
 
       if (method === 'PUT') {
+        if (tooLarge(request, 5 * 1024 * 1024)) return err('body exceeds the 5MB cap', 413);   // 0.14.0 (K8): before the read
         const body = new Uint8Array(await request.arrayBuffer());
         if (!body.length) return err('empty body');
         if (body.length > 5 * 1024 * 1024) return err('body exceeds the 5MB cap', 413);
@@ -587,6 +771,11 @@ export default {
         // rotate current → prev, then store (latest + one generation kept)
         const cur = await env.LIJ_KV.get(`lspscb:${pubkey}`, 'arrayBuffer');
         const curMeta = await env.LIJ_KV.get(`lspscbmeta:${pubkey}`);
+        // 0.14.0 (K9): the same copy again is an OK, never a rotation (a replay used to cost the real previous
+        // generation); a push older than the stored copy is refused
+        let meta = null; try { meta = curMeta ? JSON.parse(curMeta) : null; } catch (_) { meta = null; }
+        if (meta && meta.sha256 === hash) return json({ ok: true, sha256: hash, size: body.length, repeat: true });
+        if (meta && Number.isFinite(Number(meta.ts)) && ts <= Number(meta.ts)) return err('older than the stored copy', 409);
         if (cur) await env.LIJ_KV.put(`lspscb:${pubkey}:prev`, cur);
         if (curMeta) await env.LIJ_KV.put(`lspscbmeta:${pubkey}:prev`, curMeta);
         await env.LIJ_KV.put(`lspscb:${pubkey}`, body);
@@ -614,56 +803,31 @@ export default {
     }
 
     // ── LSPS1 Channel Request — proxy to adapter ─────────────────────────────
-    // Browser calls this; Worker forwards to the adapter with the secret header.
-    // Keeps the adapter secret out of the browser.
-
-    if (path === '/lsps1/channel' && method === 'POST') {
-      let body;
-      try {
-        body = await request.json();
-      } catch (_) {
-        return err('Invalid JSON');
-      }
-
-      const adapterUrl = env.LIJ_ADAPTER_URL;
-      const adapterSecret = env.LIJ_ADAPTER_SECRET;
-
-      if (!adapterUrl || !adapterSecret) {
-        return err('Adapter not configured', 503);
-      }
-
-      try {
-        const adapterResponse = await fetch(`${adapterUrl}/lsps1/channel`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-adapter-secret': adapterSecret,
-          },
-          body: JSON.stringify(body),
-        });
-
-        const data = await adapterResponse.json();
-        return json(data, adapterResponse.status);
-      } catch (e) {
-        return err(`Adapter fetch failed: ${e.message}`, 502);
-      }
+    // 0.15.0 (S63, Kimi round 2 K11 — DP "Remove it"): /lsps1/channel was a proxy to an adapter route that does not
+    // exist; nothing could complete through it, and it carried the adapter secret on every try. Retired.
+    if (path === '/lsps1/channel') {
+      return json({ error: 'retired — the adapter has no /lsps1/channel; wallets open channels through LSPS2 (JIT) at their provider', retired_in: '0.15.0' }, 410);
     }
 
     // ── Wallet Backup (signed challenge-response, no shared token) ───────────
 
     // Issue a single-use nonce bound to the caller's portable pubkey.
     if (path === '/backup/challenge' && method === 'GET') {
+      { const lim = await rateLimited(env, 'RL_WRITE', request); if (lim) return lim; }   // 0.16.0: 300/min per address
       const pubkey = url.searchParams.get('pubkey');
-      if (!pubkey || !hexToBytes(pubkey)) return err('Missing or invalid pubkey');
+      const pkb = pubkey ? hexToBytes(pubkey) : null;
+      if (!pkb || pkb.length !== 33) return err('Missing or invalid pubkey');   // 0.14.0 (K4): a 33-byte key — any even-length hex used to mint one
       const nonce = [...crypto.getRandomValues(new Uint8Array(32))]
         .map((b) => b.toString(16).padStart(2, '0'))
         .join('');
-      // 120s TTL (KV minimum is 60s); single-use — deleted on successful verify.
-      await env.LIJ_KV.put(`bkpchal:${pubkey}`, nonce, { expirationTtl: 120 });
+      // 120s TTL (KV minimum is 60s); single-use — deleted on successful verify. 0.14.0 (K4): one key per challenge.
+      await env.LIJ_KV.put(`bkpchal:${pubkey}:${nonce}`, nonce, { expirationTtl: 120 });
       return json({ nonce, expires_in: 120 });
     }
 
     if (path === '/backup' && method === 'POST') {
+      { const lim = await rateLimited(env, 'RL_WRITE', request); if (lim) return lim; }   // 0.16.0: 300/min per address
+      if (tooLarge(request, 8 * 1024 * 1024)) return err('body exceeds the 8 MB cap', 413);   // 0.14.0 (K8)
       let body;
       try {
         body = await request.json();
@@ -674,6 +838,9 @@ export default {
       const { pubkey_hex, nonce, signature, blob } = body;
       if (!pubkey_hex || !nonce || !signature || !blob) {
         return err('Missing pubkey_hex / nonce / signature / blob');
+      }
+      if (typeof blob !== 'object' || !Number.isSafeInteger(blob.version) || blob.version < 0) {
+        return err('blob.version must be a whole number');   // 0.14.0 (K6b): an object or a missing number passed the `>=` check below and froze the copy
       }
       if (!(await verifyBackupAuth(env, 'backup-push', pubkey_hex, nonce, signature))) {
         return err('Invalid signature or expired challenge', 401);
@@ -688,11 +855,11 @@ export default {
       // another copy's. A resend of the very same copy (same number, same fingerprint) is accepted again, not refused
       // as stale: the phone's retry after a lost OK is then an OK, never a false conflict.
       const fingerprint = await blobFingerprint(blob);
-      const existing = await env.LIJ_KV.get(`backup:${pubkey_hex}`);
+      const existing = await env.LIJ_KV.get(`backup:${pubkey_hex}`, { cacheTtl: 30 });   // 0.15.0 (K2): the shortest edge cache — a write elsewhere shows within 30 s, not 60
       if (existing) {
         const prev = JSON.parse(existing);
         if (prev.version === blob.version && fingerprint && prev.fingerprint === fingerprint) {
-          await env.LIJ_KV.delete(`bkpchal:${pubkey_hex}`);
+          await env.LIJ_KV.delete(`bkpchal:${pubkey_hex}:${nonce}`);
           return json({ ok: true, version: blob.version, repeat: true, fingerprint });
         }
         if (prev.version >= blob.version) {
@@ -704,12 +871,14 @@ export default {
       }
 
       await env.LIJ_KV.put(`backup:${pubkey_hex}`, JSON.stringify(fingerprint ? { ...blob, fingerprint } : blob));
-      await env.LIJ_KV.delete(`bkpchal:${pubkey_hex}`);
+      await env.LIJ_KV.delete(`bkpchal:${pubkey_hex}:${nonce}`);
       return json({ ok: true, version: blob.version, fingerprint });
     }
 
     // Authenticated read (POST so the signature travels in the body).
     if (path === '/backup/fetch' && method === 'POST') {
+      { const lim = await rateLimited(env, 'RL_WRITE', request); if (lim) return lim; }   // 0.16.0: 300/min per address
+      if (tooLarge(request, 64 * 1024)) return err('body exceeds the 64 KB cap', 413);   // 0.14.0 (K8)
       let body;
       try {
         body = await request.json();
@@ -724,9 +893,9 @@ export default {
       if (!(await verifyBackupAuth(env, 'backup-read', pubkey_hex, nonce, signature))) {
         return err('Invalid signature or expired challenge', 401);
       }
-      await env.LIJ_KV.delete(`bkpchal:${pubkey_hex}`);
+      await env.LIJ_KV.delete(`bkpchal:${pubkey_hex}:${nonce}`);
 
-      const raw = await env.LIJ_KV.get(`backup:${pubkey_hex}`);
+      const raw = await env.LIJ_KV.get(`backup:${pubkey_hex}`, { cacheTtl: 30 });   // 0.15.0 (K2)
       if (!raw) {
         return json({ found: false }, 404);
       }
@@ -739,6 +908,8 @@ export default {
     // unlock; this sends two numbers, read from the copy's unencrypted envelope. Same signed challenge as /backup/fetch
     // (action "backup-read"); 200 {found:false} when no copy is held — a 404 means only that the route is missing.
     if (path === '/backup/meta' && method === 'POST') {
+      { const lim = await rateLimited(env, 'RL_WRITE', request); if (lim) return lim; }   // 0.16.0: 300/min per address
+      if (tooLarge(request, 64 * 1024)) return err('body exceeds the 64 KB cap', 413);   // 0.14.0 (K8)
       let body;
       try {
         body = await request.json();
@@ -752,8 +923,8 @@ export default {
       if (!(await verifyBackupAuth(env, 'backup-read', pubkey_hex, nonce, signature))) {
         return err('Invalid signature or expired challenge', 401);
       }
-      await env.LIJ_KV.delete(`bkpchal:${pubkey_hex}`);
-      const raw = await env.LIJ_KV.get(`backup:${pubkey_hex}`);
+      await env.LIJ_KV.delete(`bkpchal:${pubkey_hex}:${nonce}`);
+      const raw = await env.LIJ_KV.get(`backup:${pubkey_hex}`, { cacheTtl: 30 });   // 0.15.0 (K2)
       if (!raw) return json({ found: false });
       let b = {};
       try { b = JSON.parse(raw) || {}; } catch (_) { b = {}; }
@@ -767,6 +938,8 @@ export default {
     // wrote the blob can delete it. Idempotent: deleting nothing is still ok:true.
     // (Erase on the phone is local-only; this is the other half — "off means off".)
     if (path === '/backup/forget' && method === 'POST') {
+      { const lim = await rateLimited(env, 'RL_WRITE', request); if (lim) return lim; }   // 0.16.0: 300/min per address
+      if (tooLarge(request, 64 * 1024)) return err('body exceeds the 64 KB cap', 413);   // 0.14.0 (K8)
       let body;
       try {
         body = await request.json();
@@ -780,8 +953,8 @@ export default {
       if (!(await verifyBackupAuth(env, 'backup-forget', pubkey_hex, nonce, signature))) {
         return err('Invalid signature or expired challenge', 401);
       }
-      await env.LIJ_KV.delete(`bkpchal:${pubkey_hex}`);
-      const existed = !!(await env.LIJ_KV.get(`backup:${pubkey_hex}`));
+      await env.LIJ_KV.delete(`bkpchal:${pubkey_hex}:${nonce}`);
+      const existed = !!(await env.LIJ_KV.get(`backup:${pubkey_hex}`, { cacheTtl: 30 }));   // 0.15.0 (K2)
       await env.LIJ_KV.delete(`backup:${pubkey_hex}`);
       return json({ ok: true, existed });
     }

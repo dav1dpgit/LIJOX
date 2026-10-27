@@ -1,6 +1,6 @@
 {
   "name": "lij-worker",
-  "version": "0.13.0",
+  "version": "0.17.1",
   "private": true,
   "description": "Lightning-in-a-Jar Worker: LSP registry + signed wallet-state backup",
   "dependencies": {

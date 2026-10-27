@@ -41,6 +41,26 @@ jobs:
         working-directory: lij-worker
         run: node test-backup-meta.mjs
 
+      - name: Round-2 gate (0.14.0, S63 — the shape rules, the cursor, the per-nonce challenge, the caps; a red here blocks deploy)
+        working-directory: lij-worker
+        run: node test-round2.mjs
+
+      - name: Round-3 gate (0.15.0, S63 — the signed name transfer, cacheTtl 30 on the backup reads, /lsps1/channel retired; a red here blocks deploy)
+        working-directory: lij-worker
+        run: node test-round3.mjs
+
+      - name: Round-4 gate (0.16.0, S63 — the per-address rate limit on the write routes; a red here blocks deploy)
+        working-directory: lij-worker
+        run: node test-round4.mjs
+
+      - name: Round-5 gate (0.17.0, S63 — Phase C — the clock, the tombstone, the signed mirror routes; a red here blocks deploy)
+        working-directory: lij-worker
+        run: node test-round5.mjs
+
+      - name: The box's door (0.17.0, S63 — Phase C — the same code under Node with the file store, over HTTP; the two doors converge; the export; a red here blocks deploy)
+        working-directory: lij-worker
+        run: node node/test-node.mjs
+
       - name: Diagnose — secret presence only (never values)
         if: github.repository == 'dav1dpgit/lightning-in-a-jar'
         run: |
@@ -67,8 +87,13 @@ jobs:
           H=$(curl -sf https://lij-worker.dp-a95.workers.dev/health)
           echo "$H"; echo "$H" | grep -q '"ok":true'
           echo "— /backup/challenge issues a nonce (KV binding alive) —"
-          C=$(curl -sf "https://lij-worker.dp-a95.workers.dev/backup/challenge?pubkey=aabb")
+          C=$(curl -sf "https://lij-worker.dp-a95.workers.dev/backup/challenge?pubkey=020000000000000000000000000000000000000000000000000000000000000001")   # 0.14.0 (K4): a 33-byte key — "aabb" is refused now
           echo "$C" | grep -q '"nonce"'
+          echo "— a two-byte pubkey mints no challenge (0.14.0 K4) —"
+          CODE0=$(curl -s -o /dev/null -w "%{http_code}" "https://lij-worker.dp-a95.workers.dev/backup/challenge?pubkey=aabb")
+          [ "$CODE0" = "400" ]
+          echo "— /health names 0.14.0 or later —"
+          echo "$H" | grep -Eq '"version":"0\.(1[4-9]|[2-9][0-9])\.'
           echo "— unsigned register refused (S41 invariant: 403, nothing stored) —"
           TS=$(date +%s)
           CODE=$(curl -s -o /tmp/reg.json -w "%{http_code}" -X POST https://lij-worker.dp-a95.workers.dev/lsps/register -H 'Content-Type: application/json' -d "{\"name\":\"smoke\",\"pubkey\":\"020000000000000000000000000000000000000000000000000000000000000001\",\"endpoint\":\"https://smoke.invalid\",\"fee_ppm\":1,\"ts\":$TS,\"signature\":\"placeholder\"}")

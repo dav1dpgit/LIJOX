@@ -11,3 +11,27 @@ id = "13cec7dca0c247f290bb4a3b12ed98e3"
 routes = [
   { pattern = "lightninginajar.xyz/.well-known/lnurlp/*", zone_name = "lightninginajar.xyz" },
 ]
+
+# 0.16.0 (S63, Kimi round 2 K3/K8 — DP's numbers): the per-address rate limits (approximate, per Cloudflare location;
+# wrangler 4.36.0+). RL_REGISTER on /lsps/register and /lsps/unregister; RL_WRITE on the other write routes.
+[[ratelimits]]
+name = "RL_REGISTER"
+namespace_id = "1001"
+
+  [ratelimits.simple]
+  limit = 60
+  period = 60
+
+[[ratelimits]]
+name = "RL_WRITE"
+namespace_id = "1002"
+
+  [ratelimits.simple]
+  limit = 300
+  period = 60
+
+# 0.17.0 (S63, Phase C): the box's mirror key — its PUBKEY (66 hex), printed by lij-registry at its first boot on the
+# UM890 ("lij-registry: mirror pubkey …"). Empty = the mirror routes answer 503 and the worker runs as before. The
+# private half is born on the box (/srv/lij-registry/mirror.key) and never leaves it.
+[vars]
+LIJ_MIRROR_PUBKEY = "029c69fc8eee989bd30661c2a644b11e4f06e290393803fca5e88fb12d1b35b938"
