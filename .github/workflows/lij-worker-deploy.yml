@@ -57,6 +57,10 @@ jobs:
         working-directory: lij-worker
         run: node test-round5.mjs
 
+      - name: Round-6 gate (0.18.0, S64 — K6a — the push's proof binds the copy; v1 taken this one release; a red here blocks deploy)
+        working-directory: lij-worker
+        run: node test-round6.mjs
+
       - name: The box's door (0.17.0, S63 — Phase C — the same code under Node with the file store, over HTTP; the two doors converge; the export; a red here blocks deploy)
         working-directory: lij-worker
         run: node node/test-node.mjs

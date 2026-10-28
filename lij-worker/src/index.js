@@ -132,14 +132,40 @@ async function backupDigest(action, nonceHex, pubkeyHex) {
   return new Uint8Array(await crypto.subtle.digest('SHA-256', pre));
 }
 
+// 0.18.0 (S64, Kimi K3.1 Pro round 2, K6a — engine v358): THE PUSH'S PROOF BINDS THE COPY. The v1 digest was
+// action‖nonce‖pubkey alone, so an authorisation captured on the path could push ANY copy at ANY number under it. The
+// v2 digest adds the copy's fingerprint (sha256 of its sealed bytes, the same the engine takes — blobFingerprint) and
+// its number (8 bytes big-endian): sha256("lij-backup-v2" || action || nonce || pubkey || fingerprint || version).
+// A push whose body says `auth_v: 2` is verified this way; a v1 push (an engine before v358) is still taken for ONE
+// release; the next retires v1 for the push. The reads and the forget carry no copy and keep v1.
+const BACKUP_DOMAIN_V2 = new TextEncoder().encode('lij-backup-v2');
+async function backupDigestV2(action, nonceHex, pubkeyHex, fingerprintHex, version) {
+  const actionB = new TextEncoder().encode(action);
+  const nonceB = hexToBytes(nonceHex);
+  const pubkeyB = hexToBytes(pubkeyHex);
+  const fpB = hexToBytes(fingerprintHex || '');
+  if (!nonceB || !pubkeyB || !fpB || fpB.length !== 32 || !Number.isSafeInteger(version) || version < 0) return null;
+  const verB = new Uint8Array(8); new DataView(verB.buffer).setBigUint64(0, BigInt(version));
+  const pre = new Uint8Array(BACKUP_DOMAIN_V2.length + actionB.length + nonceB.length + pubkeyB.length + 32 + 8);
+  let o = 0;
+  pre.set(BACKUP_DOMAIN_V2, o); o += BACKUP_DOMAIN_V2.length;
+  pre.set(actionB, o); o += actionB.length;
+  pre.set(nonceB, o); o += nonceB.length;
+  pre.set(pubkeyB, o); o += pubkeyB.length;
+  pre.set(fpB, o); o += 32;
+  pre.set(verB, o);
+  return new Uint8Array(await crypto.subtle.digest('SHA-256', pre));
+}
+
 // Verify a server-issued nonce + secp256k1 signature for `action` over the
 // digest. Single-use: the challenge is deleted on success by the caller.
-async function verifyBackupAuth(env, action, pubkeyHex, nonce, sigHex) {
+// 0.18.0: `bind` = { fingerprint, version } verifies the v2 digest over the copy instead of the v1 one.
+async function verifyBackupAuth(env, action, pubkeyHex, nonce, sigHex, bind) {
   if (!pubkeyHex || !nonce || !sigHex) return false;
   if (typeof nonce !== 'string' || !/^[0-9a-f]{64}$/.test(nonce)) return false;
   const stored = await env.LIJ_KV.get(`bkpchal:${pubkeyHex}:${nonce}`);   // 0.14.0 (K4): keyed by nonce — nobody overwrites another wallet's open challenge
   if (!stored || stored !== nonce) return false;
-  const digest = await backupDigest(action, nonce, pubkeyHex);
+  const digest = bind ? await backupDigestV2(action, nonce, pubkeyHex, bind.fingerprint, bind.version) : await backupDigest(action, nonce, pubkeyHex);
   const sig = hexToBytes(sigHex);
   const pub = hexToBytes(pubkeyHex);
   if (!digest || !sig || !pub) return false;
@@ -551,7 +577,7 @@ export default {
     // ── Health check ─────────────────────────────────────────────────────────
 
     if (path === '/health' && method === 'GET') {
-      return json({ ok: true, service: 'lij-worker', version: '0.17.1' });   // 0.8.0: filter_url / filter_sp · 0.9.0: /backup/meta · 0.10.0: the copy's fingerprint · 0.11.0: the tatara block (lijox-register:v3) · 0.12.0: the channel list its own · 0.12.1: close_sizes gone · 0.13.0: the routes list (lijox-register:v4) · 0.14.0: Kimi round 2 — the shape rules, the cursor, the per-nonce challenge, the freshness rules, the caps · 0.15.0: the signed name transfer (K1), cacheTtl 30 on the backup reads (K2), /lsps1/channel retired (K11) · 0.16.0: the per-address rate limit (K3/K8 — 60/min registry writes, 300/min the other writes) · 0.17.0: Phase C — the clock on every write, the tombstone on every delete, the signed /mirror/* routes for the box's door · 0.17.1: the lnurlp lookup's redirect mode 'manual' (Workers throws on 'error' — every lookup answered 502 from 0.14.0 to 0.17.0)
+      return json({ ok: true, service: 'lij-worker', version: '0.18.0' });   // 0.8.0: filter_url / filter_sp · 0.9.0: /backup/meta · 0.10.0: the copy's fingerprint · 0.11.0: the tatara block (lijox-register:v3) · 0.12.0: the channel list its own · 0.12.1: close_sizes gone · 0.13.0: the routes list (lijox-register:v4) · 0.14.0: Kimi round 2 — the shape rules, the cursor, the per-nonce challenge, the freshness rules, the caps · 0.15.0: the signed name transfer (K1), cacheTtl 30 on the backup reads (K2), /lsps1/channel retired (K11) · 0.16.0: the per-address rate limit (K3/K8 — 60/min registry writes, 300/min the other writes) · 0.17.0: Phase C — the clock on every write, the tombstone on every delete, the signed /mirror/* routes for the box's door · 0.18.0: the push's proof binds the copy (lij-backup-v2 — K6a; v1 taken this one release) · 0.17.1: the lnurlp lookup's redirect mode 'manual' (Workers throws on 'error' — every lookup answered 502 from 0.14.0 to 0.17.0)
     }
 
     // ── LSP Registry ─────────────────────────────────────────────────────────
@@ -842,19 +868,23 @@ export default {
       if (typeof blob !== 'object' || !Number.isSafeInteger(blob.version) || blob.version < 0) {
         return err('blob.version must be a whole number');   // 0.14.0 (K6b): an object or a missing number passed the `>=` check below and froze the copy
       }
-      if (!(await verifyBackupAuth(env, 'backup-push', pubkey_hex, nonce, signature))) {
-        return err('Invalid signature or expired challenge', 401);
-      }
-      if (blob.pubkey_hex !== pubkey_hex) {
-        return err('blob pubkey_hex does not match authenticated pubkey', 400);
-      }
-
       // 0.10.0 (S57, DP 2026-10-08 14:40 "Agreed on the fix for the cloud copy fingerprint. Go"): the copy's FINGERPRINT —
       // sha256 of its sealed bytes, the same the phone takes before it uploads — is kept with the copy and answered by
       // /backup/meta, so a phone can tell its own upload (the OK never arrived: the app was put away mid-upload) from
       // another copy's. A resend of the very same copy (same number, same fingerprint) is accepted again, not refused
       // as stale: the phone's retry after a lost OK is then an OK, never a false conflict.
       const fingerprint = await blobFingerprint(blob);
+      // 0.18.0 (K6a): a v2 push's proof is checked over THIS copy's fingerprint and number; a copy that carries no byte
+      // array has no fingerprint and cannot be bound — refused as a v2. A v1 push (no auth_v) is still taken this release.
+      const authV = body.auth_v === undefined ? 1 : body.auth_v;
+      if (authV !== 1 && authV !== 2) return err('auth_v must be 1 or 2');
+      if (authV === 2 && !fingerprint) return err('a v2 push binds the copy\'s bytes — encrypted_data must be a byte array');
+      if (!(await verifyBackupAuth(env, 'backup-push', pubkey_hex, nonce, signature, authV === 2 ? { fingerprint, version: blob.version } : null))) {
+        return err('Invalid signature or expired challenge', 401);
+      }
+      if (blob.pubkey_hex !== pubkey_hex) {
+        return err('blob pubkey_hex does not match authenticated pubkey', 400);
+      }
       const existing = await env.LIJ_KV.get(`backup:${pubkey_hex}`, { cacheTtl: 30 });   // 0.15.0 (K2): the shortest edge cache — a write elsewhere shows within 30 s, not 60
       if (existing) {
         const prev = JSON.parse(existing);
