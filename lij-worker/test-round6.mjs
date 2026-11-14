@@ -75,7 +75,7 @@ r = await call('POST', '/backup/meta', { pubkey_hex: pub, nonce: nonceR, signatu
 check(r.status === 200 && r.json.found === true && r.json.version === 2, 'k6a the meta read keeps the v1 proof', r);
 // the version on /health
 r = await call('GET', '/health');
-check(r.json && r.json.version === '0.18.0', 'k6a /health says 0.18.0', r.json);
+check(r.json && /^0\.(1[8-9]|[2-9][0-9])\./.test(String(r.json.version)), 'k6a /health says 0.18.0 or later (0.19.0: the state kit\'s door)', r.json);
 
 console.log('\n' + (fails ? 'FAIL · ' + fails : 'PASS · test-round6 (0.18.0 — K6a: the push\'s proof binds the copy)'));
 process.exit(fails ? 1 : 0);

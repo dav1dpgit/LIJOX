@@ -61,6 +61,14 @@ jobs:
         working-directory: lij-worker
         run: node test-round6.mjs
 
+      - name: Round-7 gate (0.19.0, S66 — the state kit's door /lsp-state, the SCB door's twin — its own keys, 20 MB, the signed GET; a red here blocks deploy)
+        working-directory: lij-worker
+        run: node test-round7.mjs
+
+      - name: The Register flag on the address lookup — passed on, never cached (0.20.0, S68 — a red here blocks deploy)
+        working-directory: lij-worker
+        run: node test-round8.mjs
+
       - name: The box's door (0.17.0, S63 — Phase C — the same code under Node with the file store, over HTTP; the two doors converge; the export; a red here blocks deploy)
         working-directory: lij-worker
         run: node node/test-node.mjs

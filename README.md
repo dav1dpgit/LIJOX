@@ -45,7 +45,8 @@ One wallet, one open copy (`docs/lijox-copy-guard-standard.md`, adapter ≥0.93.
 - `docs/static-address-model.md` — the LNURL-pay rail contract: seed-derived preimages, hash expiry, a pay code belongs to the wallet's current LSP, a definitive refusal ends the payment
 - `docs/lijox-copy-guard-standard.md` — one wallet, one open copy: the provider's part (my-channels; the 60-s open-copy window)
 - `docs/lijox-backup-standard-r1.md` — the channel backup: the keys from the 12 words, the sealed envelope, the backup server API, and the objective (an engine-neutral channel state any LIJOX wallet can carry on)
-- `docs/lijox-watchtower-note.md` — the reciprocal-watchtower obligation (ruled, not yet built)
+- `docs/lijox-watch-standard-r1.md` — the watch duties: W1, a provider keeps wallets' encrypted penalty transactions and reads every block for the old states they answer (adapter ≥0.128.0); W2, the wallet's side; W3, LND towers between providers
+- `docs/lijox-watchtower-note.md` — the earlier note on the reciprocal-watchtower obligation (the watch standard above is what was built)
 - `docs/design-22-lijox-sybil-ddos.md`, `docs/adapter-plain-terms.md`, `docs/lijox-manifest-arc-plan.md`
 
 ## Running your own registry

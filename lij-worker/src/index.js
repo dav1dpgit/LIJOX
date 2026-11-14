@@ -11,6 +11,7 @@
 //                               v3 with a tatara block; v4 with a routes list)
 //   PUT  /lsp-backup          — LSP pushes its own channel.backup (SCB),
 //                               node-key signed (lijox-scb:v1); GET restores
+//   PUT  /lsp-state           — LSP pushes its state kit (age-encrypted, 0.19.0), node-key signed; GET = the restore leg
 //   POST /backup              — push encrypted wallet state (auth required)
 //   GET  /backup/:pubkey      — pull encrypted wallet state (auth required)
 
@@ -226,6 +227,17 @@ function canonicalRegisterMsg(f) {
     n(f.fee_ppm), n(f.fee_base_sats), n(f.channel_open_fee_sats),
     n(f.max_channel_size_sats), (f.supports_jit ? '1' : '0'),
   ];
+  if (f.tower) {
+    // 0.21.0: v5 — a record that says it keeps a tower (LIJOX watch duty W1). Every v4 field in place ('' / '0' where the
+    // record has none, the routes field '' without a list), then the tower's four: offered, quota_bytes,
+    // keep_days_silent, form.
+    const t = f.tatara || {};
+    const tf = TATARA_FIELDS.map(([k, kind]) => kind === 'list' ? (t[k] || []).map((x) => n(x)).join(',')
+      : kind === 'bool' ? (t[k] ? '1' : '0') : kind === 'int' ? n(t[k]) : s(t[k]));
+    const rf = (f.routes || []).map((r) => [s(r.reach), s(r.endpoint), s(r.wss_url), s(r.filter_url)].join('|')).join(';');
+    const w = f.tower;
+    return 'lijox-register:v5:' + fields.concat([s(f.filter_url), (f.filter_sp ? '1' : '0')], tf, [rf], [(w.offered ? '1' : '0'), n(w.quota_bytes), n(w.keep_days_silent), s(w.form)]).map(encodeURIComponent).join(':');
+  }
   if (f.routes && f.routes.length) {
     const t = f.tatara || {};
     const tf = TATARA_FIELDS.map(([k, kind]) => kind === 'list' ? (t[k] || []).map((x) => n(x)).join(',')
@@ -329,6 +341,26 @@ function cleanRoutes(v) {
   return out;
 }
 
+// 0.21.0 (S69, DP 2026-11-14 "Add the tower info to the registry record" — LIJOX watch duty W1,
+// docs/lijox-watch-standard-r1.md §1): the `tower` block — whether this provider keeps wallets' encrypted penalty
+// transactions and watches the chain for them, the room per wallet key, how long a silent key is kept, and the form
+// of the items. Shape only: exactly {offered, quota_bytes, keep_days_silent, form}; offered a boolean; the two numbers
+// whole and within bounds; form a short lowercase word. Absent → null (the record signs as before); anything else
+// that fails → undefined (refused). What a wallet does with it is the wallet's: it still asks the provider itself
+// whether its tower is watching now.
+const TOWER_KEYS = ['offered', 'quota_bytes', 'keep_days_silent', 'form'];
+function cleanTower(v) {
+  if (v === undefined || v === null) return null;
+  if (typeof v !== 'object' || Array.isArray(v)) return undefined;
+  const keys = Object.keys(v);
+  if (keys.length !== TOWER_KEYS.length || keys.some((k) => !TOWER_KEYS.includes(k))) return undefined;
+  if (typeof v.offered !== 'boolean') return undefined;
+  if (!Number.isSafeInteger(v.quota_bytes) || v.quota_bytes < 0 || v.quota_bytes > 1e12) return undefined;
+  if (!Number.isSafeInteger(v.keep_days_silent) || v.keep_days_silent < 0 || v.keep_days_silent > 36500) return undefined;
+  if (typeof v.form !== 'string' || !/^[a-z0-9-]{1,16}$/.test(v.form)) return undefined;
+  return { offered: v.offered, quota_bytes: v.quota_bytes, keep_days_silent: v.keep_days_silent, form: v.form };
+}
+
 // 0.6.0 (S45, #6 registry hygiene): an LSP leaves the list with a signed
 // request. Canonical: pubkey + ts only; ts must be NEWER than the current
 // registration's ts, so a captured unregister cannot be replayed against a
@@ -387,6 +419,18 @@ function canonicalScbPush(pubkey, ts, sha256hex) {
 function canonicalScbGet(pubkey, ts) {
   return `lijox-scbget:v1:${pubkey}:${ts}`;
 }
+// 0.19.0 (S66, box recovery v0.1 — DP's rulings 2026-11-04): THE STATE KIT, the SCB door's twin. The box's own state (the
+// float wallet's descriptors, the adapter's secrets and state files, bitcoin.conf, the tunnel's files, the units) in one
+// age-encrypted archive a day — ciphertext here by construction (the private half of the age key is in the operator's
+// custody beside the seed words). The same node-key signature, its own canon and its own KV keys (lspstate:*), never
+// the SCB's; latest + one previous generation; 20 MB the line (KV takes 25 MB a value; the box's script stops at 20).
+function canonicalStatePush(pubkey, ts, sha256hex) {
+  return `lijox-statepush:v1:${pubkey}:${ts}:${sha256hex}`;
+}
+function canonicalStateGet(pubkey, ts) {
+  return `lijox-stateget:v1:${pubkey}:${ts}`;
+}
+const STATE_KIT_MAX_BYTES = 20 * 1024 * 1024;
 async function sha256HexOf(bytes) {
   const d = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
   return Array.from(d).map(b => b.toString(16).padStart(2, '0')).join('');
@@ -473,9 +517,14 @@ export default {
     if (path.startsWith('/.well-known/lnurlp/') && method === 'GET') {
       const name = path.slice('/.well-known/lnurlp/'.length).toLowerCase();
       if (!NAME_RE.test(name)) return json({ status: 'ERROR', reason: 'bad name' }, 400);
+      // 0.20.0 (S68, Register amount sharing — docs/register-mode-plan-v2.1.md): the flag `?register` on a shop's
+      // Register QR is passed on to the provider, and that answer is NEVER kept or served from the 60-s copy — it
+      // carries a one-use rate stamp made for this one ask; two payors must never be handed the same one. A lookup
+      // without the flag (every name@host payment) is unchanged.
+      const isRegister = url.searchParams.has('register');
       const cache = caches.default;
       const cacheKey = new Request(new URL(`/.well-known/lnurlp/${name}`, 'https://lightninginajar.xyz').toString(), { method: 'GET' });
-      const hit = await cache.match(cacheKey);
+      const hit = isRegister ? null : await cache.match(cacheKey);
       if (hit) return hit;
       const rec = await env.LIJ_KV.get(`name:${name}`, 'json');
       if (!rec) return json({ status: 'ERROR', reason: 'unknown name' }, 404);
@@ -486,7 +535,7 @@ export default {
       // at most 64 KB of it read. 0.17.1: `redirect: 'manual'` — Workers does not implement the Fetch standard's 'error'
       // mode (a TypeError the moment the Request is built, before anything is sent); 0.14.0–0.17.0 answered 502 "LSP
       // unreachable" to EVERY lookup on Cloudflare for it (DP, 23:06). A 3xx answer is refused here instead.
-      try { up = await fetch(String(lsp.endpoint).replace(/\/+$/, '') + '/.well-known/lnurlp/' + name, { cf: { cacheTtl: 0 }, redirect: 'manual' }); }
+      try { up = await fetch(String(lsp.endpoint).replace(/\/+$/, '') + '/.well-known/lnurlp/' + name + (isRegister ? '?register' : ''), { cf: { cacheTtl: 0 }, redirect: 'manual' }); }
       catch (_) { return json({ status: 'ERROR', reason: 'LSP unreachable' }, 502); }
       if (up.status >= 300 && up.status < 400) return json({ status: 'ERROR', reason: 'LSP unreachable' }, 502);   // a redirect is not an answer
       let text = '';
@@ -499,8 +548,8 @@ export default {
           text = new TextDecoder().decode(parts.length === 1 ? parts[0] : parts.reduce((a, p) => { const o = new Uint8Array(a.length + p.length); o.set(a); o.set(p, a.length); return o; }, new Uint8Array(0)));
         }
       } catch (_) { return json({ status: 'ERROR', reason: 'LSP unreachable' }, 502); }
-      const out = new Response(text, { status: up.status, headers: { ...CORS, 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=60' } });
-      if (up.status === 200) { try { await cache.put(cacheKey, out.clone()); } catch (_) {} }
+      const out = new Response(text, { status: up.status, headers: { ...CORS, 'Content-Type': 'application/json', 'Cache-Control': isRegister ? 'no-store' : 'public, max-age=60' } });
+      if (up.status === 200 && !isRegister) { try { await cache.put(cacheKey, out.clone()); } catch (_) {} }
       return out;
     }
 
@@ -577,7 +626,7 @@ export default {
     // ── Health check ─────────────────────────────────────────────────────────
 
     if (path === '/health' && method === 'GET') {
-      return json({ ok: true, service: 'lij-worker', version: '0.18.0' });   // 0.8.0: filter_url / filter_sp · 0.9.0: /backup/meta · 0.10.0: the copy's fingerprint · 0.11.0: the tatara block (lijox-register:v3) · 0.12.0: the channel list its own · 0.12.1: close_sizes gone · 0.13.0: the routes list (lijox-register:v4) · 0.14.0: Kimi round 2 — the shape rules, the cursor, the per-nonce challenge, the freshness rules, the caps · 0.15.0: the signed name transfer (K1), cacheTtl 30 on the backup reads (K2), /lsps1/channel retired (K11) · 0.16.0: the per-address rate limit (K3/K8 — 60/min registry writes, 300/min the other writes) · 0.17.0: Phase C — the clock on every write, the tombstone on every delete, the signed /mirror/* routes for the box's door · 0.18.0: the push's proof binds the copy (lij-backup-v2 — K6a; v1 taken this one release) · 0.17.1: the lnurlp lookup's redirect mode 'manual' (Workers throws on 'error' — every lookup answered 502 from 0.14.0 to 0.17.0)
+      return json({ ok: true, service: 'lij-worker', version: '0.21.0' });   /* 0.21.0: the tower block (lijox-register:v5) */   // 0.8.0: filter_url / filter_sp · 0.9.0: /backup/meta · 0.10.0: the copy's fingerprint · 0.11.0: the tatara block (lijox-register:v3) · 0.12.0: the channel list its own · 0.12.1: close_sizes gone · 0.13.0: the routes list (lijox-register:v4) · 0.14.0: Kimi round 2 — the shape rules, the cursor, the per-nonce challenge, the freshness rules, the caps · 0.15.0: the signed name transfer (K1), cacheTtl 30 on the backup reads (K2), /lsps1/channel retired (K11) · 0.16.0: the per-address rate limit (K3/K8 — 60/min registry writes, 300/min the other writes) · 0.17.0: Phase C — the clock on every write, the tombstone on every delete, the signed /mirror/* routes for the box's door · 0.18.0: the push's proof binds the copy (lij-backup-v2 — K6a; v1 taken this one release) · 0.17.1: the lnurlp lookup's redirect mode 'manual' (Workers throws on 'error' — every lookup answered 502 from 0.14.0 to 0.17.0) · 0.19.0: the state kit's door /lsp-state (S66, box recovery v0.1 — the SCB door's twin, its own keys, 20 MB)
     }
 
     // ── LSP Registry ─────────────────────────────────────────────────────────
@@ -647,7 +696,7 @@ export default {
         name, pubkey, endpoint, fee_ppm,
         fee_base_sats, channel_open_fee_sats, max_channel_size_sats,
         supports_jit, route_endpoint, route_macaroon, wss_url, signature, ts,
-        filter_url, filter_sp, tatara, routes,
+        filter_url, filter_sp, tatara, routes, tower,
       } = body;
 
       if (!name || !pubkey || !endpoint || fee_ppm === undefined || !signature || ts === undefined) {
@@ -694,6 +743,11 @@ export default {
       if (rts && (rts[0].endpoint !== endpoint || rts[0].wss_url !== (wss_url || null) || rts[0].filter_url !== filterUrl)) {
         return err('routes[0] must repeat the record\'s endpoint, wss_url and filter_url (the operator\'s first choice is what older wallets read)');
       }
+      // 0.21.0: the optional tower block (shape only)
+      const twr = cleanTower(tower);
+      if (twr === undefined) {
+        return err('tower malformed (exactly {offered, quota_bytes, keep_days_silent, form}; offered true or false; the two numbers whole and not negative; form a short lowercase word)');
+      }
 
       const lsp = {
         name,
@@ -711,6 +765,7 @@ export default {
         filter_sp: filterUrl ? Boolean(filter_sp) : false,  // 0.8.0: its server serves the silent-payment index (/sp/info)
         ...(tat ? { tatara: tat } : {}),                    // 0.11.0: present only when offered (v1/v2 records keep their shape)
         ...(rts ? { routes: rts } : {}),                    // 0.13.0: present only when sent (one-door records keep their shape)
+        ...(twr ? { tower: twr } : {}),                     // 0.21.0: present only when sent (records without a tower keep their shape and their signed text)
         uptime: 100,
         registered_at: Date.now(),   // = last seen; adapters ≥0.71 re-register on a cadence
         ts: tsNum,
@@ -825,6 +880,51 @@ export default {
           'x-lij-stored-at': String(meta.stored_at || ''),
           ...CORS,
         },
+      });
+    }
+
+    // ── LSP state kit — signed by the node key (lijox-state:v1), 0.19.0 — the SCB door's twin ─────────────────────
+    if (path === '/lsp-state' && (method === 'PUT' || method === 'GET')) {
+      if (method === 'PUT') { const lim = await rateLimited(env, 'RL_WRITE', request); if (lim) return lim; }
+      const pubkey = String(request.headers.get('x-lij-pubkey') || '').toLowerCase();
+      const ts = Number(request.headers.get('x-lij-ts'));
+      const sig = request.headers.get('x-lij-sig') || '';
+      const pk = hexToBytes(pubkey);
+      if (!pk || pk.length !== 33) return err('x-lij-pubkey must be 33-byte compressed hex');
+      if (!sig) return err('x-lij-sig required');
+      if (!Number.isFinite(ts) || Math.abs(Date.now() / 1000 - ts) > 600) return err('x-lij-ts outside the 600s window', 403);
+
+      if (method === 'PUT') {
+        if (tooLarge(request, STATE_KIT_MAX_BYTES)) return err('body exceeds the 20MB cap', 413);
+        const body = new Uint8Array(await request.arrayBuffer());
+        if (!body.length) return err('empty body');
+        if (body.length > STATE_KIT_MAX_BYTES) return err('body exceeds the 20MB cap', 413);
+        const hash = await sha256HexOf(body);
+        const ok = await verifyLndSignedRegistration(pubkey, canonicalStatePush(pubkey, ts, hash), sig);
+        if (!ok) return err('signature does not verify for this pubkey over this blob', 403);
+        const cur = await env.LIJ_KV.get(`lspstate:${pubkey}`, 'arrayBuffer');
+        const curMeta = await env.LIJ_KV.get(`lspstatemeta:${pubkey}`);
+        let meta = null; try { meta = curMeta ? JSON.parse(curMeta) : null; } catch (_) { meta = null; }
+        if (meta && meta.sha256 === hash) return json({ ok: true, sha256: hash, size: body.length, repeat: true });
+        if (meta && Number.isFinite(Number(meta.ts)) && ts <= Number(meta.ts)) return err('older than the stored copy', 409);
+        if (cur) await env.LIJ_KV.put(`lspstate:${pubkey}:prev`, cur);
+        if (curMeta) await env.LIJ_KV.put(`lspstatemeta:${pubkey}:prev`, curMeta);
+        await env.LIJ_KV.put(`lspstate:${pubkey}`, body);
+        await env.LIJ_KV.put(`lspstatemeta:${pubkey}`, JSON.stringify({ sha256: hash, size: body.length, ts, stored_at: Date.now() }));
+        return json({ ok: true, sha256: hash, size: body.length });
+      }
+
+      // GET — the restore leg (?gen=prev for the previous generation)
+      const ok = await verifyLndSignedRegistration(pubkey, canonicalStateGet(pubkey, ts), sig);
+      if (!ok) return err('signature does not verify for this pubkey', 403);
+      const which = url.searchParams.get('gen') === 'prev' ? ':prev' : '';
+      const blob = await env.LIJ_KV.get(`lspstate:${pubkey}${which}`, 'arrayBuffer');
+      if (!blob) return err('no state kit stored for this pubkey', 404);
+      let meta = {};
+      try { meta = JSON.parse(await env.LIJ_KV.get(`lspstatemeta:${pubkey}${which}`) || '{}'); } catch (_) {}
+      return new Response(blob, {
+        status: 200,
+        headers: { 'Content-Type': 'application/octet-stream', 'x-lij-sha256': meta.sha256 || '', 'x-lij-stored-at': String(meta.stored_at || ''), ...CORS },
       });
     }
 
@@ -999,4 +1099,4 @@ export default {
 };
 // Named exports for the local sign\xe2\x86\x94verify gate (test-register-sig.mjs).
 // The Workers runtime uses only the default export; these are inert there.
-export { canonicalRegisterMsg, canonicalUnregisterMsg, verifyLndSignedRegistration, zbase32Decode, canonicalScbPush, canonicalScbGet, cleanFilterUrl, cleanTatara, cleanRoutes, TATARA_FIELDS, ROUTE_REACH };
+export { canonicalRegisterMsg, canonicalUnregisterMsg, verifyLndSignedRegistration, zbase32Decode, canonicalScbPush, canonicalScbGet, canonicalStatePush, canonicalStateGet, STATE_KIT_MAX_BYTES, cleanFilterUrl, cleanTatara, cleanRoutes, cleanTower, TOWER_KEYS, TATARA_FIELDS, ROUTE_REACH };

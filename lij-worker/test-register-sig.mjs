@@ -8,7 +8,7 @@
 import * as secp from '@noble/secp256k1';
 import { createHmac, createHash, randomBytes } from 'node:crypto';
 import worker from './src/index.js';
-import { canonicalRegisterMsg, canonicalUnregisterMsg, verifyLndSignedRegistration, zbase32Decode, canonicalScbPush, canonicalScbGet, cleanFilterUrl, cleanTatara, cleanRoutes, TATARA_FIELDS, ROUTE_REACH } from './src/index.js';
+import { canonicalRegisterMsg, canonicalUnregisterMsg, verifyLndSignedRegistration, zbase32Decode, canonicalScbPush, canonicalScbGet, cleanFilterUrl, cleanTatara, cleanRoutes, cleanTower, TATARA_FIELDS, ROUTE_REACH } from './src/index.js';
 
 // noble v2 needs an hmac for RFC6979 signing (verify/recovery does not).
 secp.etc.hmacSha256Sync = (key, ...msgs) => {
@@ -366,6 +366,32 @@ t('non-zbase32 chars rejected', !(await verifyLndSignedRegistration(pub, workerM
     b3.signature = lndSign(priv, canonicalRegisterMsg(rec3));
     r = await post(b3);
     t('a one-door record through the handler: stored with no routes key (an older adapter re-registering drops the list)', r.status === 200 && !('routes' in JSON.parse(kv.get('lsp:' + pub))));
+    // ── 0.21.0 (S69): lijox-register:v5 — a record that carries a tower block (LIJOX watch duty W1) ──
+    const TW = { offered: true, quota_bytes: 5242880, keep_days_silent: 400, form: 'teos-v1' };
+    t('v5: a tower block is kept as sent; none → null', JSON.stringify(cleanTower(TW)) === JSON.stringify(TW) && cleanTower(undefined) === null && cleanTower(null) === null);
+    t('v5: malformed blocks are refused', [{ ...TW, extra: 1 }, { offered: true }, { ...TW, offered: 'yes' }, { ...TW, quota_bytes: -1 }, { ...TW, quota_bytes: 1.5 }, { ...TW, keep_days_silent: 99999 }, { ...TW, form: 'TEOS v1' }, [], 'x'].every((x) => cleanTower(x) === undefined));
+    const rec5 = { ...rec4, ts: now + 2, tower: cleanTower(TW) };
+    const m5 = canonicalRegisterMsg(rec5), m4b = canonicalRegisterMsg({ ...rec4, ts: now + 2 });
+    t('v5 canonical: the v4 fields, then offered · quota_bytes · keep_days_silent · form', m5.startsWith('lijox-register:v5:') && m5.split(':').length === m4b.split(':').length + 4 && m5.slice('lijox-register:v5:'.length).startsWith(m4b.slice('lijox-register:v4:'.length)) && m5.endsWith(':1:5242880:400:teos-v1'));
+    t('v5 without routes: the routes field is empty, in place', canonicalRegisterMsg({ ...rec3, ts: now + 2, tower: cleanTower(TW) }).endsWith('::1:5242880:400:teos-v1'));
+    t('a record without a tower signs exactly as before (v4)', m4b.startsWith('lijox-register:v4:') && !m4b.includes('teos'));
+    const b5 = { ...b4, ts: now + 2, tower: TW };
+    b5.signature = lndSign(priv, m5);
+    r = await post(b5);
+    const kept5 = JSON.parse(kv.get('lsp:' + pub));
+    t('v5 through the handler: stored with its tower', r.status === 200 && JSON.stringify(kept5.tower) === JSON.stringify(TW));
+    r = await post({ ...b5, ts: now + 3, tower: { ...TW, offered: false } });
+    t('v5 through the handler: the tower changed after signing → 403', r.status === 403);
+    r = await post({ ...b5, ts: now + 3, tower: undefined });
+    t('v5 through the handler: the tower stripped after signing → 403 (no downgrade to v4 under a v5 signature)', r.status === 403);
+    r = await post({ ...b5, ts: now + 3, tower: { ...TW, color: 'red' } });
+    t('v5 through the handler: a malformed block → 400, the good record untouched', r.status === 400 && /tower malformed/.test(r.json && r.json.error || '') && JSON.parse(kv.get('lsp:' + pub)).tower.offered === true);
+    const g5 = await worker.fetch(new Request('https://lij-worker.test/lsps'), env, {});
+    const gl5 = (await g5.json()).lsps;
+    t('GET /lsps serves the tower as stored', gl5.length === 1 && JSON.stringify(gl5[0].tower) === JSON.stringify(TW));
+    const b6 = { ...b4, ts: now + 4 }; b6.signature = lndSign(priv, canonicalRegisterMsg({ ...rec4, ts: now + 4 }));
+    r = await post(b6);
+    t('a record re-registered without a tower: stored with no tower key', r.status === 200 && !('tower' in JSON.parse(kv.get('lsp:' + pub))));
   }
 }
 
