@@ -44,7 +44,6 @@ One wallet, one open copy (`docs/lijox-copy-guard-standard.md`, adapter ≥0.93.
 - `docs/openintent-v1.md` — Open-Intent v1 (channel-open intents)
 - `docs/static-address-model.md` — the LNURL-pay rail contract: seed-derived preimages, hash expiry, a pay code belongs to the wallet's current LSP, a definitive refusal ends the payment
 - `docs/lijox-copy-guard-standard.md` — one wallet, one open copy: the provider's part (my-channels; the 60-s open-copy window)
-- `docs/lijox-backup-standard-r1.md` — the channel backup: the keys from the 12 words, the sealed envelope, the backup server API, and the objective (an engine-neutral channel state any LIJOX wallet can carry on)
 - `docs/lijox-watch-standard-r1.md` — the watch duties: W1, a provider keeps wallets' encrypted penalty transactions and reads every block for the old states they answer (adapter ≥0.128.0); W2, the wallet's side; W3, LND towers between providers
 - `docs/lijox-watch-standard-r2.md` — the watch duties, round 2 (the one to read; r1 is kept as written): the provider's tower, the voucher that lets a wallet's key in (adapter ≥0.130.0), the wallet's side as built, providers guarding each other, joining and how the duties are checked
 - `docs/lijox-watchtower-note.md` — the earlier note on the reciprocal-watchtower obligation (the watch standard above is what was built)
