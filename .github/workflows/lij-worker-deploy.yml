@@ -69,6 +69,10 @@ jobs:
         working-directory: lij-worker
         run: node test-round8.mjs
 
+      - name: A refusal names the copy held; the registry's record of accepted uploads (0.23.0 — a red here blocks deploy)
+        working-directory: lij-worker
+        run: node test-round9.mjs
+
       - name: The box's door (0.17.0, S63 — Phase C — the same code under Node with the file store, over HTTP; the two doors converge; the export; a red here blocks deploy)
         working-directory: lij-worker
         run: node node/test-node.mjs

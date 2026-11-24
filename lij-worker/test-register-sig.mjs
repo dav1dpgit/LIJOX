@@ -8,7 +8,7 @@
 import * as secp from '@noble/secp256k1';
 import { createHmac, createHash, randomBytes } from 'node:crypto';
 import worker from './src/index.js';
-import { canonicalRegisterMsg, canonicalUnregisterMsg, verifyLndSignedRegistration, zbase32Decode, canonicalScbPush, canonicalScbGet, cleanFilterUrl, cleanTatara, cleanRoutes, cleanTower, TATARA_FIELDS, ROUTE_REACH } from './src/index.js';
+import { canonicalRegisterMsg, canonicalUnregisterMsg, verifyLndSignedRegistration, zbase32Decode, canonicalScbPush, canonicalScbGet, cleanFilterUrl, cleanTatara, cleanRoutes, cleanTower, cleanChanConfs, TATARA_FIELDS, ROUTE_REACH } from './src/index.js';
 
 // noble v2 needs an hmac for RFC6979 signing (verify/recovery does not).
 secp.etc.hmacSha256Sync = (key, ...msgs) => {
@@ -392,6 +392,32 @@ t('non-zbase32 chars rejected', !(await verifyLndSignedRegistration(pub, workerM
     const b6 = { ...b4, ts: now + 4 }; b6.signature = lndSign(priv, canonicalRegisterMsg({ ...rec4, ts: now + 4 }));
     r = await post(b6);
     t('a record re-registered without a tower: stored with no tower key', r.status === 200 && !('tower' in JSON.parse(kv.get('lsp:' + pub))));
+    const b7 = { ...b5, ts: now + 7 }; b7.signature = lndSign(priv, canonicalRegisterMsg({ ...rec5, ts: now + 7 }));
+    r = await post(b7);
+    // ── 0.22.0 (S71): lijox-register:v6 — a record that states the confirmations asked for a channel the wallet funds ──
+    const CC = { min: 3, max: 6 };
+    t('v6: a chan_confs block is kept as sent; none → null', JSON.stringify(cleanChanConfs(CC)) === JSON.stringify(CC) && cleanChanConfs(undefined) === null && cleanChanConfs(null) === null && JSON.stringify(cleanChanConfs({ min: 1, max: 1 })) === '{"min":1,"max":1}');
+    t('v6: malformed blocks are refused', [{ ...CC, extra: 1 }, { min: 3 }, { min: 0, max: 3 }, { min: 4, max: 3 }, { min: 3, max: 145 }, { min: 1.5, max: 3 }, { min: '3', max: 6 }, [], 'x'].every((x) => cleanChanConfs(x) === undefined));
+    const rec6 = { ...rec5, ts: now + 8, chan_confs: cleanChanConfs(CC) };
+    const m6 = canonicalRegisterMsg(rec6), m5b = canonicalRegisterMsg({ ...rec5, ts: now + 8 });
+    t('v6 canonical: the v5 fields, then min · max', m6.startsWith('lijox-register:v6:') && m6.split(':').length === m5b.split(':').length + 2 && m6.slice('lijox-register:v6:'.length).startsWith(m5b.slice('lijox-register:v5:'.length)) && m6.endsWith(':3:6'));
+    t('v6 without a tower: the tower fields are 0 · 0 · 0 · empty, in place', canonicalRegisterMsg({ ...rec4, ts: now + 8, chan_confs: { min: 1, max: 1 } }).endsWith(':0:0:0::1:1'));
+    t('a record without chan_confs signs exactly as before (v5)', m5b.startsWith('lijox-register:v5:') && m5b.endsWith(':teos-v1'));
+    const bc = { ...b5, ts: now + 8, chan_confs: CC };
+    bc.signature = lndSign(priv, m6);
+    r = await post(bc);
+    t('v6 through the handler: stored with its chan_confs and its tower', r.status === 200 && JSON.stringify(JSON.parse(kv.get('lsp:' + pub)).chan_confs) === JSON.stringify(CC) && JSON.parse(kv.get('lsp:' + pub)).tower.offered === true);
+    r = await post({ ...bc, ts: now + 9, chan_confs: { min: 1, max: 6 } });
+    t('v6 through the handler: the block changed after signing → 403', r.status === 403);
+    r = await post({ ...bc, ts: now + 9, chan_confs: undefined });
+    t('v6 through the handler: the block stripped after signing → 403 (no downgrade to v5 under a v6 signature)', r.status === 403);
+    r = await post({ ...bc, ts: now + 9, chan_confs: { min: 6, max: 3 } });
+    t('v6 through the handler: a malformed block → 400, the good record untouched', r.status === 400 && /chan_confs malformed/.test(r.json && r.json.error || '') && JSON.parse(kv.get('lsp:' + pub)).chan_confs.max === 6);
+    const gl6 = (await (await worker.fetch(new Request('https://lij-worker.test/lsps'), env, {})).json()).lsps;
+    t('GET /lsps serves chan_confs as stored', gl6.length === 1 && JSON.stringify(gl6[0].chan_confs) === JSON.stringify(CC));
+    const b9 = { ...b4, ts: now + 10 }; b9.signature = lndSign(priv, canonicalRegisterMsg({ ...rec4, ts: now + 10 }));
+    r = await post(b9);
+    t('a record re-registered without chan_confs: stored with no chan_confs key', r.status === 200 && !('chan_confs' in JSON.parse(kv.get('lsp:' + pub))));
   }
 }
 

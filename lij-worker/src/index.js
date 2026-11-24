@@ -41,6 +41,19 @@ function err(msg, status = 400) {
   return json({ error: msg }, status);
 }
 
+// 0.23.0 (S71 Fri 2026-11-20, DP 09:37 "a record of the attempt and confirmations should be kept and self healing
+// achieved, on either side of the flow (cloud and local)" · 09:45 "go beyond A-E — approved"; incident
+// docs/incidents/2026-11-20-channel-close-r2.md): THE REGISTRY'S OWN RECORD OF THE UPLOADS IT ACCEPTED for a wallet —
+// the last ACCEPTED_KEEP of them: the copy's number (v), its fingerprint (fp, sha256 of the encrypted bytes) and the
+// REGISTRY'S clock at that moment (at, unix ms — not the phone's date). It is kept inside the copy's own entry (no
+// second write, and it cannot disagree with the copy), it is written by the registry only (a list sent by a phone is
+// dropped), and /backup/meta answers it to the wallet's own key. With it either side can say what was accepted and when.
+const ACCEPTED_KEEP = 8;
+function acceptedList(prev) {
+  const a = (prev && Array.isArray(prev.accepted)) ? prev.accepted : [];
+  return a.filter(e => e && Number.isSafeInteger(e.v) && e.v >= 0 && typeof e.fp === 'string' && /^[0-9a-f]{64}$/.test(e.fp) && Number.isSafeInteger(e.at) && e.at >= 0).map(e => ({ v: e.v, fp: e.fp, at: e.at })).slice(-ACCEPTED_KEEP);
+}
+
 // 0.16.0 (S63, Kimi round 2 K3/K8 — DP's numbers): THE RATE LIMIT, per client address, through a Workers rate-limit
 // binding (approximate, per Cloudflare location). RL_REGISTER 60/min on the registry writes; RL_WRITE 300/min on the
 // other write routes. No binding (the tests' env) → nothing is limited.
@@ -227,6 +240,17 @@ function canonicalRegisterMsg(f) {
     n(f.fee_ppm), n(f.fee_base_sats), n(f.channel_open_fee_sats),
     n(f.max_channel_size_sats), (f.supports_jit ? '1' : '0'),
   ];
+  if (f.chan_confs) {
+    // 0.22.0: v6 — a record that states how many confirmations this provider asks for before a channel the WALLET funds
+    // can be used. Every v5 field in place (the tower's four as '0', '0', '0', '' where the record keeps no tower), then
+    // the block's two: min, max.
+    const t = f.tatara || {};
+    const tf = TATARA_FIELDS.map(([k, kind]) => kind === 'list' ? (t[k] || []).map((x) => n(x)).join(',')
+      : kind === 'bool' ? (t[k] ? '1' : '0') : kind === 'int' ? n(t[k]) : s(t[k]));
+    const rf = (f.routes || []).map((r) => [s(r.reach), s(r.endpoint), s(r.wss_url), s(r.filter_url)].join('|')).join(';');
+    const w = f.tower || {};
+    return 'lijox-register:v6:' + fields.concat([s(f.filter_url), (f.filter_sp ? '1' : '0')], tf, [rf], [(w.offered ? '1' : '0'), n(w.quota_bytes), n(w.keep_days_silent), s(w.form)], [n(f.chan_confs.min), n(f.chan_confs.max)]).map(encodeURIComponent).join(':');
+  }
   if (f.tower) {
     // 0.21.0: v5 — a record that says it keeps a tower (LIJOX watch duty W1). Every v4 field in place ('' / '0' where the
     // record has none, the routes field '' without a list), then the tower's four: offered, quota_bytes,
@@ -359,6 +383,22 @@ function cleanTower(v) {
   if (!Number.isSafeInteger(v.keep_days_silent) || v.keep_days_silent < 0 || v.keep_days_silent > 36500) return undefined;
   if (typeof v.form !== 'string' || !/^[a-z0-9-]{1,16}$/.test(v.form)) return undefined;
   return { offered: v.offered, quota_bytes: v.quota_bytes, keep_days_silent: v.keep_days_silent, form: v.form };
+}
+// 0.22.0 (S71, DP 2026-11-19 22:08 "1, 2, & 3 are go" — docs/design/channel-confs/channel-confs-r1.md): the `chan_confs`
+// block — how many confirmations this provider asks for before a channel the WALLET funds can be used: at least `min`,
+// at most `max` (a provider that scales the number with the channel's size states both ends; one number is min = max).
+// Shape only: exactly {min, max}; whole numbers from 1 to 144; min not above max. Absent → null (the record signs as
+// before); anything else that fails → undefined (refused). The wallet checks the statement itself: at each channel it
+// funds it reads the number the provider's node really asked for and shows any difference.
+const CHAN_CONFS_KEYS = ['min', 'max'];
+function cleanChanConfs(v) {
+  if (v === undefined || v === null) return null;
+  if (typeof v !== 'object' || Array.isArray(v)) return undefined;
+  const keys = Object.keys(v);
+  if (keys.length !== CHAN_CONFS_KEYS.length || keys.some((k) => !CHAN_CONFS_KEYS.includes(k))) return undefined;
+  if (!Number.isSafeInteger(v.min) || v.min < 1 || v.min > 144) return undefined;
+  if (!Number.isSafeInteger(v.max) || v.max < v.min || v.max > 144) return undefined;
+  return { min: v.min, max: v.max };
 }
 
 // 0.6.0 (S45, #6 registry hygiene): an LSP leaves the list with a signed
@@ -626,7 +666,7 @@ export default {
     // ── Health check ─────────────────────────────────────────────────────────
 
     if (path === '/health' && method === 'GET') {
-      return json({ ok: true, service: 'lij-worker', version: '0.21.0' });   /* 0.21.0: the tower block (lijox-register:v5) */   // 0.8.0: filter_url / filter_sp · 0.9.0: /backup/meta · 0.10.0: the copy's fingerprint · 0.11.0: the tatara block (lijox-register:v3) · 0.12.0: the channel list its own · 0.12.1: close_sizes gone · 0.13.0: the routes list (lijox-register:v4) · 0.14.0: Kimi round 2 — the shape rules, the cursor, the per-nonce challenge, the freshness rules, the caps · 0.15.0: the signed name transfer (K1), cacheTtl 30 on the backup reads (K2), /lsps1/channel retired (K11) · 0.16.0: the per-address rate limit (K3/K8 — 60/min registry writes, 300/min the other writes) · 0.17.0: Phase C — the clock on every write, the tombstone on every delete, the signed /mirror/* routes for the box's door · 0.18.0: the push's proof binds the copy (lij-backup-v2 — K6a; v1 taken this one release) · 0.17.1: the lnurlp lookup's redirect mode 'manual' (Workers throws on 'error' — every lookup answered 502 from 0.14.0 to 0.17.0) · 0.19.0: the state kit's door /lsp-state (S66, box recovery v0.1 — the SCB door's twin, its own keys, 20 MB)
+      return json({ ok: true, service: 'lij-worker', version: '0.23.0' });   /* 0.23.0: a refused upload names the copy held; the registry's record of accepted uploads · 0.22.0: the chan_confs block (lijox-register:v6) · 0.21.0: the tower block (lijox-register:v5) */   // 0.8.0: filter_url / filter_sp · 0.9.0: /backup/meta · 0.10.0: the copy's fingerprint · 0.11.0: the tatara block (lijox-register:v3) · 0.12.0: the channel list its own · 0.12.1: close_sizes gone · 0.13.0: the routes list (lijox-register:v4) · 0.14.0: Kimi round 2 — the shape rules, the cursor, the per-nonce challenge, the freshness rules, the caps · 0.15.0: the signed name transfer (K1), cacheTtl 30 on the backup reads (K2), /lsps1/channel retired (K11) · 0.16.0: the per-address rate limit (K3/K8 — 60/min registry writes, 300/min the other writes) · 0.17.0: Phase C — the clock on every write, the tombstone on every delete, the signed /mirror/* routes for the box's door · 0.18.0: the push's proof binds the copy (lij-backup-v2 — K6a; v1 taken this one release) · 0.17.1: the lnurlp lookup's redirect mode 'manual' (Workers throws on 'error' — every lookup answered 502 from 0.14.0 to 0.17.0) · 0.19.0: the state kit's door /lsp-state (S66, box recovery v0.1 — the SCB door's twin, its own keys, 20 MB)
     }
 
     // ── LSP Registry ─────────────────────────────────────────────────────────
@@ -696,7 +736,7 @@ export default {
         name, pubkey, endpoint, fee_ppm,
         fee_base_sats, channel_open_fee_sats, max_channel_size_sats,
         supports_jit, route_endpoint, route_macaroon, wss_url, signature, ts,
-        filter_url, filter_sp, tatara, routes, tower,
+        filter_url, filter_sp, tatara, routes, tower, chan_confs,
       } = body;
 
       if (!name || !pubkey || !endpoint || fee_ppm === undefined || !signature || ts === undefined) {
@@ -749,6 +789,12 @@ export default {
         return err('tower malformed (exactly {offered, quota_bytes, keep_days_silent, form}; offered true or false; the two numbers whole and not negative; form a short lowercase word)');
       }
 
+      // 0.22.0: the optional chan_confs block (shape only)
+      const ccf = cleanChanConfs(chan_confs);
+      if (ccf === undefined) {
+        return err('chan_confs malformed (exactly {min, max}; whole numbers from 1 to 144; min not above max)');
+      }
+
       const lsp = {
         name,
         pubkey,
@@ -766,6 +812,7 @@ export default {
         ...(tat ? { tatara: tat } : {}),                    // 0.11.0: present only when offered (v1/v2 records keep their shape)
         ...(rts ? { routes: rts } : {}),                    // 0.13.0: present only when sent (one-door records keep their shape)
         ...(twr ? { tower: twr } : {}),                     // 0.21.0: present only when sent (records without a tower keep their shape and their signed text)
+        ...(ccf ? { chan_confs: ccf } : {}),                // 0.22.0: present only when sent (records without it keep their shape and their signed text)
         uptime: 100,
         registered_at: Date.now(),   // = last seen; adapters ≥0.71 re-register on a cadence
         ts: tsNum,
@@ -986,6 +1033,7 @@ export default {
         return err('blob pubkey_hex does not match authenticated pubkey', 400);
       }
       const existing = await env.LIJ_KV.get(`backup:${pubkey_hex}`, { cacheTtl: 30 });   // 0.15.0 (K2): the shortest edge cache — a write elsewhere shows within 30 s, not 60
+      let acceptedBefore = [];   // 0.23.0
       if (existing) {
         const prev = JSON.parse(existing);
         if (prev.version === blob.version && fingerprint && prev.fingerprint === fingerprint) {
@@ -993,14 +1041,27 @@ export default {
           return json({ ok: true, version: blob.version, repeat: true, fingerprint });
         }
         if (prev.version >= blob.version) {
-          return err(
-            `Stale backup rejected: existing v${prev.version} >= incoming v${blob.version}`,
-            409
-          );
+          // 0.23.0: THE REFUSAL NAMES THE COPY THE REGISTRY HOLDS — its number, its fingerprint, its date. Found
+          // 2026-11-20: a phone's upload was stored but the answer never reached it; its next upload (the same number,
+          // new bytes) was refused, and the phone could not tell from "existing v7314 >= incoming v7314" that the copy
+          // held was its own. Now the one answer says which copy is held, taken from the very read that decided the
+          // refusal — the phone needs no second question (which the 30-s cache could answer with an older copy). The
+          // words of the refusal are unchanged (engines before v381 read them).
+          const pfp = (typeof prev.fingerprint === 'string' && /^[0-9a-f]{64}$/.test(prev.fingerprint)) ? prev.fingerprint : null;
+          return json({
+            error: `Stale backup rejected: existing v${prev.version} >= incoming v${blob.version}`,
+            existing_version: prev.version,
+            existing_fingerprint: pfp,
+            existing_saved_at_ms: Number(prev.saved_at_ms) || 0,
+          }, 409);
         }
+        acceptedBefore = acceptedList(prev);
       }
 
-      await env.LIJ_KV.put(`backup:${pubkey_hex}`, JSON.stringify(fingerprint ? { ...blob, fingerprint } : blob));
+      // 0.23.0: this upload joins the registry's record of accepted uploads (see acceptedList); a copy without a
+      // fingerprint is stored as before and the record is carried on unchanged
+      const accepted = fingerprint ? acceptedBefore.concat([{ v: blob.version, fp: fingerprint, at: Date.now() }]).slice(-ACCEPTED_KEEP) : acceptedBefore;
+      await env.LIJ_KV.put(`backup:${pubkey_hex}`, JSON.stringify(fingerprint ? { ...blob, fingerprint, accepted } : { ...blob, accepted }));
       await env.LIJ_KV.delete(`bkpchal:${pubkey_hex}:${nonce}`);
       return json({ ok: true, version: blob.version, fingerprint });
     }
@@ -1060,7 +1121,8 @@ export default {
       try { b = JSON.parse(raw) || {}; } catch (_) { b = {}; }
       // 0.10.0: the stored copy's fingerprint rides along (null for a copy stored before 0.10.0)
       const fp = (typeof b.fingerprint === 'string' && /^[0-9a-f]{64}$/.test(b.fingerprint)) ? b.fingerprint : null;
-      return json({ found: true, version: Number(b.version) || 0, saved_at_ms: Number(b.saved_at_ms) || 0, fingerprint: fp });
+      // 0.23.0: and the registry's record of the uploads it accepted for this wallet (the last 8; [] for a copy stored before 0.23.0)
+      return json({ found: true, version: Number(b.version) || 0, saved_at_ms: Number(b.saved_at_ms) || 0, fingerprint: fp, accepted: acceptedList(b) });
     }
 
     // 0.7.0 (S46, DP GO 2026-09-13): the wallet forgets its own cloud copy — the same
@@ -1099,4 +1161,4 @@ export default {
 };
 // Named exports for the local sign\xe2\x86\x94verify gate (test-register-sig.mjs).
 // The Workers runtime uses only the default export; these are inert there.
-export { canonicalRegisterMsg, canonicalUnregisterMsg, verifyLndSignedRegistration, zbase32Decode, canonicalScbPush, canonicalScbGet, canonicalStatePush, canonicalStateGet, STATE_KIT_MAX_BYTES, cleanFilterUrl, cleanTatara, cleanRoutes, cleanTower, TOWER_KEYS, TATARA_FIELDS, ROUTE_REACH };
+export { cleanChanConfs, canonicalRegisterMsg, canonicalUnregisterMsg, verifyLndSignedRegistration, zbase32Decode, canonicalScbPush, canonicalScbGet, canonicalStatePush, canonicalStateGet, STATE_KIT_MAX_BYTES, cleanFilterUrl, cleanTatara, cleanRoutes, cleanTower, TOWER_KEYS, TATARA_FIELDS, ROUTE_REACH };

@@ -41,7 +41,7 @@ check(r.status === 200 && r.json && r.json.found === false, 'b1 no copy held: 20
 store.set('backup:' + pub, JSON.stringify({ pubkey_hex: pub, version: 7, saved_at_ms: 1791307311302, encrypted_data: 'ab'.repeat(5000) }));
 r = await call('POST', '/backup/meta', await signed('backup-read'));
 check(r.status === 200 && r.json.found === true && r.json.version === 7 && r.json.saved_at_ms === 1791307311302, 'b2 found: version 7 and the date');
-check(JSON.stringify(Object.keys(r.json).sort()) === JSON.stringify(['fingerprint', 'found', 'saved_at_ms', 'version']), 'b2 nothing else in the answer (no blob; 0.10.0: the fingerprint, null for this copy)');
+check(JSON.stringify(Object.keys(r.json).sort()) === JSON.stringify(['accepted', 'fingerprint', 'found', 'saved_at_ms', 'version']) && JSON.stringify(r.json.accepted) === '[]', 'b2 nothing else in the answer (no blob; 0.10.0: the fingerprint, null for this copy; 0.23.0: the registry\'s record of accepted uploads, empty for this copy)');
 // b3 — the challenge is single-use
 const once = await signed('backup-read');
 await call('POST', '/backup/meta', once);
@@ -71,7 +71,7 @@ r = await call('POST', '/backup', Object.assign(await signed('backup-push'), { b
 check(r.status === 200 && r.json.ok === true && r.json.version === 10 && r.json.fingerprint === sha(blobA.encrypted_data) && !r.json.repeat, 'b8 a push answers ok with the copy\'s fingerprint (sha256 of its sealed bytes)');
 r = await call('POST', '/backup/meta', await signed('backup-read'));
 check(r.json.found === true && r.json.version === 10 && r.json.saved_at_ms === 1791307311302 && r.json.fingerprint === sha(blobA.encrypted_data), 'b8 /backup/meta answers the number, the date and the fingerprint');
-check(JSON.stringify(Object.keys(r.json).sort()) === JSON.stringify(['fingerprint', 'found', 'saved_at_ms', 'version']), 'b8 nothing else in the answer (no blob)');
+check(JSON.stringify(Object.keys(r.json).sort()) === JSON.stringify(['accepted', 'fingerprint', 'found', 'saved_at_ms', 'version']) && r.json.accepted.length === 1 && r.json.accepted[0].v === r.json.version && r.json.accepted[0].fp === r.json.fingerprint, 'b8 nothing else in the answer (no blob; 0.23.0: the record of accepted uploads — this one)');
 // b9 — a resend of the very same copy (the phone\'s OK was lost) is an OK again, not a refusal; the copy is unchanged
 const before = store.get('backup:' + pub);
 r = await call('POST', '/backup', Object.assign(await signed('backup-push'), { blob: blobA }));
