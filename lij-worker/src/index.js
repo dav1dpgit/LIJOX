@@ -229,6 +229,8 @@ async function verifyBackupAuth(env, action, pubkeyHex, nonce, sigHex, bind) {
 // first route repeats the top-level endpoint / wss_url / filter_url, so a v3 reader sees the operator's first choice.
 // Records without routes sign as v1/v2/v3, byte for byte as before. (0.12.0's one-day 'v4' carried close_sizes and
 // was retired by 0.12.1 the same day; no record ever carried it, so the prefix is free.)
+// 0.24.0 (S72, F4 — docs/design/routes/f4-r1.md): a record that carries an `rpc` list is signed as 'lijox-register:v7:'
+// + every v6 field in place + the list's words joined by ','. A record without the list signs as before.
 // This function is duplicated VERBATIM in lij-adapter.js (the signer). Any
 // change here changes there in the same release, or registration 403s.
 function canonicalRegisterMsg(f) {
@@ -240,6 +242,18 @@ function canonicalRegisterMsg(f) {
     n(f.fee_ppm), n(f.fee_base_sats), n(f.channel_open_fee_sats),
     n(f.max_channel_size_sats), (f.supports_jit ? '1' : '0'),
   ];
+  if (f.rpc && f.rpc.length) {
+    // 0.24.0: v7 — a record that says which request forms this provider takes inside the Lightning connection (`rpc`,
+    // today the one word 'lsps0'). Every v6 field in place (the chan_confs block's two as '0', '0' where the record
+    // has none), then ONE field: the words joined by ','.
+    const t = f.tatara || {};
+    const tf = TATARA_FIELDS.map(([k, kind]) => kind === 'list' ? (t[k] || []).map((x) => n(x)).join(',')
+      : kind === 'bool' ? (t[k] ? '1' : '0') : kind === 'int' ? n(t[k]) : s(t[k]));
+    const rf = (f.routes || []).map((r) => [s(r.reach), s(r.endpoint), s(r.wss_url), s(r.filter_url)].join('|')).join(';');
+    const w = f.tower || {};
+    const c = f.chan_confs || {};
+    return 'lijox-register:v7:' + fields.concat([s(f.filter_url), (f.filter_sp ? '1' : '0')], tf, [rf], [(w.offered ? '1' : '0'), n(w.quota_bytes), n(w.keep_days_silent), s(w.form)], [n(c.min), n(c.max)], [f.rpc.map((x) => s(x)).join(',')]).map(encodeURIComponent).join(':');
+  }
   if (f.chan_confs) {
     // 0.22.0: v6 — a record that states how many confirmations this provider asks for before a channel the WALLET funds
     // can be used. Every v5 field in place (the tower's four as '0', '0', '0', '' where the record keeps no tower), then
@@ -390,6 +404,19 @@ function cleanTower(v) {
 // Shape only: exactly {min, max}; whole numbers from 1 to 144; min not above max. Absent → null (the record signs as
 // before); anything else that fails → undefined (refused). The wallet checks the statement itself: at each channel it
 // funds it reads the number the provider's node really asked for and shows any difference.
+// 0.24.0 (S72, F4 — docs/design/routes/f4-r1.md; the plan docs/design/privacy-program/privacy-program-r2.md §2.8): the
+// `rpc` list — the request forms this provider takes INSIDE the Lightning connection. Today one word exists: 'lsps0'
+// (LSPS0, message 37913, the provider's `lijox.*` methods). It is the provider's signed word that a wallet need not send
+// it web requests for what it serves there; WHICH methods it serves the wallet asks the provider itself, inside the
+// connection (lijox.hello). Shape only: a list of 1 to 4 different words, each 1–16 lowercase letters or digits. Absent
+// → null (the record signs as before); anything else that fails → undefined (refused).
+function cleanRpc(v) {
+  if (v === undefined || v === null) return null;
+  if (!Array.isArray(v) || v.length < 1 || v.length > 4) return undefined;
+  if (v.some((x) => typeof x !== 'string' || !/^[a-z0-9]{1,16}$/.test(x))) return undefined;
+  if (new Set(v).size !== v.length) return undefined;
+  return v.slice();
+}
 const CHAN_CONFS_KEYS = ['min', 'max'];
 function cleanChanConfs(v) {
   if (v === undefined || v === null) return null;
@@ -666,7 +693,7 @@ export default {
     // ── Health check ─────────────────────────────────────────────────────────
 
     if (path === '/health' && method === 'GET') {
-      return json({ ok: true, service: 'lij-worker', version: '0.23.0' });   /* 0.23.0: a refused upload names the copy held; the registry's record of accepted uploads · 0.22.0: the chan_confs block (lijox-register:v6) · 0.21.0: the tower block (lijox-register:v5) */   // 0.8.0: filter_url / filter_sp · 0.9.0: /backup/meta · 0.10.0: the copy's fingerprint · 0.11.0: the tatara block (lijox-register:v3) · 0.12.0: the channel list its own · 0.12.1: close_sizes gone · 0.13.0: the routes list (lijox-register:v4) · 0.14.0: Kimi round 2 — the shape rules, the cursor, the per-nonce challenge, the freshness rules, the caps · 0.15.0: the signed name transfer (K1), cacheTtl 30 on the backup reads (K2), /lsps1/channel retired (K11) · 0.16.0: the per-address rate limit (K3/K8 — 60/min registry writes, 300/min the other writes) · 0.17.0: Phase C — the clock on every write, the tombstone on every delete, the signed /mirror/* routes for the box's door · 0.18.0: the push's proof binds the copy (lij-backup-v2 — K6a; v1 taken this one release) · 0.17.1: the lnurlp lookup's redirect mode 'manual' (Workers throws on 'error' — every lookup answered 502 from 0.14.0 to 0.17.0) · 0.19.0: the state kit's door /lsp-state (S66, box recovery v0.1 — the SCB door's twin, its own keys, 20 MB)
+      return json({ ok: true, service: 'lij-worker', version: '0.25.0' });   /* 0.24.0: the rpc list (lijox-register:v7) — the provider's signed word that it takes requests inside the Lightning connection · 0.23.0: a refused upload names the copy held; the registry's record of accepted uploads · 0.22.0: the chan_confs block (lijox-register:v6) · 0.21.0: the tower block (lijox-register:v5) */   // 0.8.0: filter_url / filter_sp · 0.9.0: /backup/meta · 0.10.0: the copy's fingerprint · 0.11.0: the tatara block (lijox-register:v3) · 0.12.0: the channel list its own · 0.12.1: close_sizes gone · 0.13.0: the routes list (lijox-register:v4) · 0.14.0: Kimi round 2 — the shape rules, the cursor, the per-nonce challenge, the freshness rules, the caps · 0.15.0: the signed name transfer (K1), cacheTtl 30 on the backup reads (K2), /lsps1/channel retired (K11) · 0.16.0: the per-address rate limit (K3/K8 — 60/min registry writes, 300/min the other writes) · 0.17.0: Phase C — the clock on every write, the tombstone on every delete, the signed /mirror/* routes for the box's door · 0.18.0: the push's proof binds the copy (lij-backup-v2 — K6a; v1 taken this one release) · 0.17.1: the lnurlp lookup's redirect mode 'manual' (Workers throws on 'error' — every lookup answered 502 from 0.14.0 to 0.17.0) · 0.19.0: the state kit's door /lsp-state (S66, box recovery v0.1 — the SCB door's twin, its own keys, 20 MB)
     }
 
     // ── LSP Registry ─────────────────────────────────────────────────────────
@@ -681,12 +708,12 @@ export default {
         if (raw) {
           try {
             const rec = JSON.parse(raw);
-            // S41: proofs get checked, not published. signature/ts are
-            // write-time evidence for the registry, not wallet data — no
-            // client reads them, and republishing a live proof invites
-            // replay games inside the freshness window.
-            delete rec.signature;
-            delete rec.ts;
+            // 0.25.0 (S72, F — docs/design/routes/sigcheck-r1.md): `signature` and `ts` stay on the record. A wallet
+            // rebuilds the signed text from the record as served (canonicalRegisterMsg) and checks the signature
+            // itself, so a record changed after signing — by this registry or by anything in the way — is not used.
+            // (S41 deleted the two here: "proofs get checked, not published". A copied registration can be posted
+            // again only inside 600 s of its ts, and since 0.14.0 (K5) one older than the record held, or not newer
+            // than the key's departure, is refused; posted again it stores the same record the provider signed.)
             // 0.6.0: liveness fields. registered_at is rewritten on every (re-)registration,
             // so it is "last seen"; stale = no registration for 24h. Wallets act on `stale`
             // only once adapters re-register on a cadence (0.71.0) — until then it is
@@ -736,7 +763,7 @@ export default {
         name, pubkey, endpoint, fee_ppm,
         fee_base_sats, channel_open_fee_sats, max_channel_size_sats,
         supports_jit, route_endpoint, route_macaroon, wss_url, signature, ts,
-        filter_url, filter_sp, tatara, routes, tower, chan_confs,
+        filter_url, filter_sp, tatara, routes, tower, chan_confs, rpc,
       } = body;
 
       if (!name || !pubkey || !endpoint || fee_ppm === undefined || !signature || ts === undefined) {
@@ -795,6 +822,12 @@ export default {
         return err('chan_confs malformed (exactly {min, max}; whole numbers from 1 to 144; min not above max)');
       }
 
+      // 0.24.0: the optional rpc list (shape only)
+      const rpcL = cleanRpc(rpc);
+      if (rpcL === undefined) {
+        return err('rpc malformed (a list of 1 to 4 different words, each 1–16 lowercase letters or digits)');
+      }
+
       const lsp = {
         name,
         pubkey,
@@ -813,6 +846,7 @@ export default {
         ...(rts ? { routes: rts } : {}),                    // 0.13.0: present only when sent (one-door records keep their shape)
         ...(twr ? { tower: twr } : {}),                     // 0.21.0: present only when sent (records without a tower keep their shape and their signed text)
         ...(ccf ? { chan_confs: ccf } : {}),                // 0.22.0: present only when sent (records without it keep their shape and their signed text)
+        ...(rpcL ? { rpc: rpcL } : {}),                     // 0.24.0: present only when sent (records without it keep their shape and their signed text)
         uptime: 100,
         registered_at: Date.now(),   // = last seen; adapters ≥0.71 re-register on a cadence
         ts: tsNum,
@@ -1161,4 +1195,4 @@ export default {
 };
 // Named exports for the local sign\xe2\x86\x94verify gate (test-register-sig.mjs).
 // The Workers runtime uses only the default export; these are inert there.
-export { cleanChanConfs, canonicalRegisterMsg, canonicalUnregisterMsg, verifyLndSignedRegistration, zbase32Decode, canonicalScbPush, canonicalScbGet, canonicalStatePush, canonicalStateGet, STATE_KIT_MAX_BYTES, cleanFilterUrl, cleanTatara, cleanRoutes, cleanTower, TOWER_KEYS, TATARA_FIELDS, ROUTE_REACH };
+export { cleanChanConfs, cleanRpc, canonicalRegisterMsg, canonicalUnregisterMsg, verifyLndSignedRegistration, zbase32Decode, canonicalScbPush, canonicalScbGet, canonicalStatePush, canonicalStateGet, STATE_KIT_MAX_BYTES, cleanFilterUrl, cleanTatara, cleanRoutes, cleanTower, TOWER_KEYS, TATARA_FIELDS, ROUTE_REACH };

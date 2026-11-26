@@ -117,7 +117,7 @@ jobs:
           echo "— unauth'd SCB push refused (S41 backup-arc invariant) —"
           CODE2=$(curl -s -o /tmp/scb.json -w "%{http_code}" -X PUT https://lij-worker.dp-a95.workers.dev/lsp-backup --data-binary 'x')
           cat /tmp/scb.json; echo; [ "$CODE2" = "400" ]
-          echo "— /lsps viability ordering + proofs-stripped invariants (retry x3 for edge settle) —"
+          echo "— /lsps viability ordering + every record carries its signature (0.25.0) (retry x3 for edge settle) —"
           ok=""
           for i in 1 2 3; do
           curl -sf https://lij-worker.dp-a95.workers.dev/lsps > /tmp/lsps.json || true
@@ -129,11 +129,25 @@ jobs:
           flags = [viable(l) for l in lsps]
           # invariant: no non-viable record may precede a viable one
           assert flags == sorted(flags, reverse=True), 'viability ordering violated: %r' % flags
-          # S41 invariant: registration proofs are never served publicly
-          assert not any(('signature' in l) or ('ts' in l) for l in lsps), 'registration proofs served publicly'
+          # 0.25.0 (S72, docs/design/routes/sigcheck-r1.md): every listed record carries the signature and ts it was
+          # stored with, so a wallet can check it. (S41 had them stripped here; that invariant is retired.)
+          assert all(isinstance(l.get('signature'), str) and l.get('signature') and isinstance(l.get('ts'), (int, float)) for l in lsps), 'a listed record without its signature or ts: %r' % [l.get('pubkey') for l in lsps if not (isinstance(l.get('signature'), str) and l.get('signature') and isinstance(l.get('ts'), (int, float)))]
           print('lsps invariants OK:', [(l.get('name'), viable(l)) for l in lsps])
           EOF
           then ok=1; break; fi
           echo "attempt $i not settled; retrying"; sleep 8
           done
           [ -n "$ok" ]
+          echo "— every live record matches its own signature, checked with this code (0.25.0: what a wallet will check) —"
+          cd lij-worker && node --input-type=module -e "
+          import { readFileSync } from 'node:fs';
+          import { canonicalRegisterMsg, verifyLndSignedRegistration } from './src/index.js';
+          const lsps = JSON.parse(readFileSync('/tmp/lsps.json', 'utf8')).lsps || [];
+          let bad = 0;
+          for (const l of lsps) {
+            const ok = await verifyLndSignedRegistration(l.pubkey, canonicalRegisterMsg(l), l.signature);
+            console.log((ok ? 'matches ' : 'DOES NOT MATCH ') + String(l.pubkey).slice(0, 16) + ' ' + JSON.stringify(l.name) + (l.stale ? ' (stale)' : ''));
+            if (!ok && !l.stale) bad++;   // a record registered in the last 24 h that does not match is a defect in this code
+          }
+          if (bad) { console.log(bad + ' live record(s) registered in the last 24 h do not match their signature'); process.exit(1); }
+          "

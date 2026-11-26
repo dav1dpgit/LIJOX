@@ -63,7 +63,7 @@ const kps = [];
 for (let i = 0; i < 5; i++) { const kp = keypair(); kps.push(kp); const r = await call('POST', '/lsps/register', regBody(kp)); check(r.status === 200 && r.json.ok === true, 'r' + i + ' a signed registration lands (200)', r.json); }
 let r = await call('GET', '/lsps');
 check(r.status === 200 && Array.isArray(r.json.lsps) && r.json.lsps.length === 5, 'K3 /lsps lists all five across three KV pages (the cursor followed)', r.json && r.json.lsps && r.json.lsps.length);
-check(r.json.lsps.every((l) => l.signature === undefined && l.ts === undefined), 'K3 the proofs are not published');
+check(r.json.lsps.every((l) => typeof l.signature === 'string' && Number.isFinite(l.ts)), '0.25.0: each listed record carries its signature and ts (K3 had them stripped)');
 
 // ── K3: the shape rules ──
 const kp = keypair();

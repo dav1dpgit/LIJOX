@@ -79,7 +79,7 @@ check(r.status === 200, 'A registers', r.json);
 let e = kv.store.get('lsp:' + A.pub);
 check(e && e.meta && Number.isFinite(e.meta.c) && e.meta.c >= T0 && e.meta.c <= Date.now(), 'the registration carries the request\'s clock (metadata {c})', e && e.meta);
 r = await call('GET', '/lsps');
-check(r.status === 200 && r.json.lsps.length === 1 && r.json.lsps[0].pubkey === A.pub && !('signature' in r.json.lsps[0]), '/lsps answers as before (the clock is metadata, not record)', r.json);
+check(r.status === 200 && r.json.lsps.length === 1 && r.json.lsps[0].pubkey === A.pub && typeof r.json.lsps[0].signature === 'string', '/lsps answers as before (the clock is metadata, not record; 0.25.0: the record carries its signature)', r.json);
 
 // ── the tombstone on every delete; one clock per request ──
 const uts = nowS() + 1;

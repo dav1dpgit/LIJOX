@@ -8,7 +8,7 @@
 import * as secp from '@noble/secp256k1';
 import { createHmac, createHash, randomBytes } from 'node:crypto';
 import worker from './src/index.js';
-import { canonicalRegisterMsg, canonicalUnregisterMsg, verifyLndSignedRegistration, zbase32Decode, canonicalScbPush, canonicalScbGet, cleanFilterUrl, cleanTatara, cleanRoutes, cleanTower, cleanChanConfs, TATARA_FIELDS, ROUTE_REACH } from './src/index.js';
+import { canonicalRegisterMsg, canonicalUnregisterMsg, verifyLndSignedRegistration, zbase32Decode, canonicalScbPush, canonicalScbGet, cleanFilterUrl, cleanTatara, cleanRoutes, cleanTower, cleanChanConfs, cleanRpc, TATARA_FIELDS, ROUTE_REACH } from './src/index.js';
 
 // noble v2 needs an hmac for RFC6979 signing (verify/recovery does not).
 secp.etc.hmacSha256Sync = (key, ...msgs) => {
@@ -360,7 +360,7 @@ t('non-zbase32 chars rejected', !(await verifyLndSignedRegistration(pub, workerM
     t('v4 through the handler: a malformed list → 400, the good record untouched', r.status === 400 && JSON.parse(kv.get('lsp:' + pub)).routes.length === 2);
     const g = await worker.fetch(new Request('https://lij-worker.test/lsps'), env, {});
     const gl = (await g.json()).lsps;
-    t('GET /lsps serves the routes as stored (signature and ts stripped as before)', g.status === 200 && gl.length === 1 && JSON.stringify(gl[0].routes) === JSON.stringify(R) && !('signature' in gl[0]) && !('ts' in gl[0]));
+    t('GET /lsps serves the routes as stored (0.25.0: with its signature and ts)', g.status === 200 && gl.length === 1 && JSON.stringify(gl[0].routes) === JSON.stringify(R) && typeof gl[0].signature === 'string' && Number.isFinite(gl[0].ts));
     const b3 = { ...body, ts: now + 1, filter_url: 'https://filters.example.org', filter_sp: true };
     const rec3 = { ...rec4, ts: now + 1, endpoint: b3.endpoint, route_endpoint: b3.route_endpoint, wss_url: b3.wss_url, filter_url: b3.filter_url }; delete rec3.routes;
     b3.signature = lndSign(priv, canonicalRegisterMsg(rec3));
@@ -418,6 +418,61 @@ t('non-zbase32 chars rejected', !(await verifyLndSignedRegistration(pub, workerM
     const b9 = { ...b4, ts: now + 10 }; b9.signature = lndSign(priv, canonicalRegisterMsg({ ...rec4, ts: now + 10 }));
     r = await post(b9);
     t('a record re-registered without chan_confs: stored with no chan_confs key', r.status === 200 && !('chan_confs' in JSON.parse(kv.get('lsp:' + pub))));
+    // ── 0.24.0 (S72, F4): lijox-register:v7 — a record that says it takes requests inside the Lightning connection ──
+    const RP = ['lsps0'];
+    t('v7: an rpc list is kept as sent; none → null', JSON.stringify(cleanRpc(RP)) === '["lsps0"]' && cleanRpc(undefined) === null && cleanRpc(null) === null && JSON.stringify(cleanRpc(['lsps0', 'x2'])) === '["lsps0","x2"]');
+    t('v7: malformed lists are refused', [[], ['lsps0', 'lsps0'], ['LSPS0'], ['a b'], [''], ['a'.repeat(17)], [1], ['a', 'b', 'c', 'd', 'e'], 'lsps0', { lsps0: true }, true].every((x) => cleanRpc(x) === undefined));
+    const rec7 = { ...rec6, ts: now + 11, rpc: cleanRpc(RP) };
+    const m7 = canonicalRegisterMsg(rec7), m6b = canonicalRegisterMsg({ ...rec6, ts: now + 11 });
+    t('v7 canonical: the v6 fields, then the list', m7.startsWith('lijox-register:v7:') && m7.split(':').length === m6b.split(':').length + 1 && m7.slice('lijox-register:v7:'.length).startsWith(m6b.slice('lijox-register:v6:'.length)) && m7.endsWith(':3:6:lsps0'));
+    t('v7 with two words: joined by a comma inside the one field', canonicalRegisterMsg({ ...rec6, ts: now + 11, rpc: ['lsps0', 'x2'] }).endsWith(':3:6:lsps0%2Cx2'));
+    t('v7 without chan_confs and without a tower: their fields are 0 · 0 · 0 · empty · 0 · 0, in place', canonicalRegisterMsg({ ...rec4, ts: now + 11, rpc: RP }).endsWith(':0:0:0::0:0:lsps0'));
+    t('a record without rpc signs exactly as before (v6)', m6b.startsWith('lijox-register:v6:') && m6b.endsWith(':3:6') && canonicalRegisterMsg({ ...rec6, ts: now + 11, rpc: [] }) === m6b);
+    const b10 = { ...bc, ts: now + 11, rpc: RP };
+    b10.signature = lndSign(priv, m7);
+    r = await post(b10);
+    const kept7 = JSON.parse(kv.get('lsp:' + pub));
+    t('v7 through the handler: stored with its rpc list, its chan_confs and its tower', r.status === 200 && JSON.stringify(kept7.rpc) === '["lsps0"]' && JSON.stringify(kept7.chan_confs) === JSON.stringify(CC) && kept7.tower.offered === true, r.json);
+    r = await post({ ...b10, ts: now + 12, rpc: ['lsps0', 'x2'] });
+    t('v7 through the handler: the list changed after signing → 403', r.status === 403);
+    r = await post({ ...b10, ts: now + 12, rpc: undefined });
+    t('v7 through the handler: the list stripped after signing → 403 (no downgrade to v6 under a v7 signature)', r.status === 403);
+    const b11 = { ...bc, ts: now + 12, rpc: RP }; b11.signature = lndSign(priv, canonicalRegisterMsg({ ...rec6, ts: now + 12 }));
+    r = await post(b11);
+    t('v7 through the handler: the list added to a record signed without it → 403', r.status === 403);
+    r = await post({ ...b10, ts: now + 12, rpc: ['LSPS0'] });
+    t('v7 through the handler: a malformed list → 400, the good record untouched', r.status === 400 && /rpc malformed/.test(r.json && r.json.error || '') && JSON.stringify(JSON.parse(kv.get('lsp:' + pub)).rpc) === '["lsps0"]');
+    const gl7 = (await (await worker.fetch(new Request('https://lij-worker.test/lsps'), env, {})).json()).lsps;
+    t('GET /lsps serves the rpc list as stored', gl7.length === 1 && JSON.stringify(gl7[0].rpc) === '["lsps0"]');
+    const b12 = { ...bc, ts: now + 13 }; b12.signature = lndSign(priv, canonicalRegisterMsg({ ...rec6, ts: now + 13 }));
+    r = await post(b12);
+    t('a record re-registered without rpc: stored with no rpc key', r.status === 200 && !('rpc' in JSON.parse(kv.get('lsp:' + pub))));
+    // ── 0.25.0 (S72, F — docs/design/routes/sigcheck-r1.md): the list hands on `signature` and `ts`, so a wallet can
+    //    rebuild the signed text from the record as served and check the signature itself ──
+    const lst = async () => (await (await worker.fetch(new Request('https://lij-worker.test/lsps'), env, {})).json()).lsps;
+    let L = await lst();
+    t('0.25.0: a listed record carries its signature and its ts', L.length === 1 && L[0].signature === b12.signature && L[0].ts === now + 13);
+    t('0.25.0: the text rebuilt from the listed record is the text that was signed (v6)', canonicalRegisterMsg(L[0]) === canonicalRegisterMsg({ ...rec6, ts: now + 13 }) && await verifyLndSignedRegistration(L[0].pubkey, canonicalRegisterMsg(L[0]), L[0].signature));
+    t('0.25.0: the registry\'s own words on a record (stale, last_seen_ms, uptime, registered_at) are not in the signed text', ['stale', 'last_seen_ms', 'first_registered_at', 'registered_at', 'uptime'].every((k) => k in L[0]) && canonicalRegisterMsg({ ...L[0], stale: true, last_seen_ms: 1, first_registered_at: 1, registered_at: 1, uptime: 3 }) === canonicalRegisterMsg(L[0]));
+    for (const [what, ch] of [['its endpoint', { endpoint: 'https://evil.example' }], ['its wss_url', { wss_url: 'wss://evil.example' }], ['a fee', { fee_ppm: L[0].fee_ppm + 1 }], ['its name', { name: 'someone else' }], ['its ts', { ts: L[0].ts + 1 }], ['a route\'s reach', { routes: L[0].routes.map((x, i) => i ? x : { ...x, reach: x.reach === 'direct' ? 'cloudflare' : 'direct' }) }], ['its tower', { tower: { ...L[0].tower, offered: !L[0].tower.offered } }], ['its chan_confs', { chan_confs: { min: L[0].chan_confs.min, max: L[0].chan_confs.max + 1 } }], ['an rpc list added', { rpc: ['lsps0'] }]]) {
+      const c = { ...L[0], ...ch };
+      t('0.25.0: a listed record with ' + what + ' changed no longer matches its signature', !(await verifyLndSignedRegistration(c.pubkey, canonicalRegisterMsg(c), c.signature)));
+    }
+    const b13 = { ...bc, ts: now + 14, rpc: RP }; b13.signature = lndSign(priv, canonicalRegisterMsg({ ...rec6, ts: now + 14, rpc: RP }));
+    r = await post(b13);
+    L = await lst();
+    t('0.25.0: a listed v7 record matches its signature', r.status === 200 && L.length === 1 && canonicalRegisterMsg(L[0]).startsWith('lijox-register:v7:') && await verifyLndSignedRegistration(L[0].pubkey, canonicalRegisterMsg(L[0]), L[0].signature));
+    { const c = { ...L[0] }; delete c.rpc;
+      t('0.25.0: the rpc list taken out of a listed record no longer matches its signature (no way back to web forms unseen)', !(await verifyLndSignedRegistration(c.pubkey, canonicalRegisterMsg(c), c.signature))); }
+    r = await post({ ...b12 });
+    t('0.25.0: a registration copied from the list and posted again, older than the record held → 409', r.status === 409, r);
+    r = await post({ ...b13 });
+    t('0.25.0: the current registration posted again stores the same record', r.status === 200 && JSON.parse(kv.get('lsp:' + pub)).signature === b13.signature);
+    { const { makeVectors, FILE } = await import('./make-wallet-vectors.mjs'); const { readFileSync } = await import('node:fs');
+      let held = ''; try { held = readFileSync(FILE, 'utf8'); } catch (e) {}
+      t('0.25.0: the table the wallet engine\'s copy of the signed text is tested against is the one this code makes (if this fails: node make-wallet-vectors.mjs, then change registry_check.rs until the engine\'s test passes)', held === '' ? (console.log('note: ' + FILE + ' is not in this checkout — nothing to compare'), true) : held === await makeVectors()); }
+    r = await (await worker.fetch(new Request('https://lij-worker.test/health'), env, {})).json();
+    t('the version on /health is 0.25.0', r.version === '0.25.0', r);
   }
 }
 

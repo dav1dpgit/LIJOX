@@ -99,7 +99,7 @@ check(e.value && e.value.pubkey === A.pub && e.metadata && e.metadata.c > 0, 'th
 const vfile = path.join(boxDir, 'kv', 'lsp', A.pub + '.v');
 check((await fs.stat(vfile)).isFile() && (await fs.stat(vfile)).mode % 0o1000 === 0o600, 'the value is a file under kv/lsp/, mode 600', vfile);
 r = await B('GET', '/lsps');
-check(r.status === 200 && r.json.lsps.length === 1 && r.json.lsps[0].pubkey === A.pub && !('signature' in r.json.lsps[0]) && r.json.lsps[0].stale === false, '/lsps on the box ranks and strips as the worker does', r.json);
+check(r.status === 200 && r.json.lsps.length === 1 && r.json.lsps[0].pubkey === A.pub && typeof r.json.lsps[0].signature === 'string' && r.json.lsps[0].stale === false, '/lsps on the box ranks and serves as the worker does', r.json);
 
 // the limit, per address (rlRegister 3 here)
 r = await B('POST', '/lsps/register', regBody(A)); r = await B('POST', '/lsps/register', regBody(A));
