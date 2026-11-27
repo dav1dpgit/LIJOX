@@ -4,7 +4,7 @@ An open, permissionless registry protocol for Lightning service providers (LSPs)
 
 LIJOX is not a federation. Anyone can publish a registry; wallets aggregate across registries on their own; the only discipline is the market — fees and behaviour, not membership. An LSP that participates serves any wallet that speaks the standard.
 
-**Status: pre-release (registry worker 0.25.0). One live registry, run by the standard's author, reached at two addresses that serve the same records: the Cloudflare worker (`lij-worker.dp-a95.workers.dev`) and the same code running on the author's own node, reached directly with no Cloudflare in between (`registry.lightninginajar.xyz`). Three registered LSPs: two run by the standard's author, and one, since 2026-11-19, by an independent operator on his own Start9 node.** That concentration is stated in the wallet's README as well; it changes as other operators register.
+**Status: registry worker 0.25.0. One live registry, run by the standard's author, reached at two addresses that serve the same records: the Cloudflare worker (`lij-worker.dp-a95.workers.dev`) and the same code running on the author's own node, reached directly with no Cloudflare in between (`registry.lightninginajar.xyz`). Three registered LSPs: two run by the standard's author, and one, since 2026-11-19, by an independent operator on his own Start9 node.** That concentration is stated in the wallet's README as well; it changes as other operators register.
 
 ## What is in this repository
 
